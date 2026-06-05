@@ -35,6 +35,11 @@ pub enum MemBackendType {
     /// no fault tax); only the not-yet-arrived dirty pages are registered with
     /// UFFD_MINOR and served by a separate process via UFFDIO_CONTINUE.
     Hybrid,
+    /// Precopy: map a shared base (`base_mem_path`) MAP_PRIVATE (clean pages shared
+    /// COW across VMs, lazily cached — works on an ext4 file, no shmem needed) and
+    /// eagerly apply the dirty delta (`backend_path` = delta file, `dirty_pages_path`
+    /// = offsets) into guest memory before resume. No UFFD.
+    Precopy,
 }
 
 /// Stores the configuration that will be used for creating a snapshot.

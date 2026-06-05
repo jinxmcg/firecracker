@@ -379,6 +379,8 @@ pub enum RestoreFromSnapshotGuestMemoryError {
     Uffd(#[from] GuestMemoryFromUffdError),
     /// Error creating guest memory from hybrid: {0}
     Hybrid(#[from] GuestMemoryFromHybridError),
+    /// Error creating guest memory from precopy: {0}
+    Precopy(GuestMemoryFromHybridError),
 }
 
 /// Loads a Microvm snapshot producing a 'paused' Microvm.
@@ -491,6 +493,12 @@ pub fn restore_from_snapshot(
             vm_resources.machine_config.huge_pages,
         )
         .map_err(RestoreFromSnapshotGuestMemoryError::Hybrid)?,
+        MemBackendType::Precopy => guest_memory_from_precopy(
+            &params.mem_backend,
+            mem_state,
+            track_dirty_pages,
+        )
+        .map_err(RestoreFromSnapshotGuestMemoryError::Precopy)?,
     };
     builder::build_microvm_from_snapshot(
         instance_info,
@@ -765,6 +773,75 @@ fn guest_memory_from_hybrid(
     forget(socket);
 
     Ok((guest_memory, Some(uffd)))
+}
+
+/// Precopy restore: map the shared base (`base_mem_path`, works on ext4 — no shmem
+/// needed) MAP_PRIVATE and eagerly write the dirty delta into guest memory before
+/// resume — NO UFFD. Clean base pages stay shared COW across VMs (lazily cached);
+/// applied delta pages become private. The trade vs Hybrid: the (small) delta must
+/// be present before resume instead of faulted on demand.
+fn guest_memory_from_precopy(
+    mem_backend: &MemBackendConfig,
+    mem_state: &GuestMemoryState,
+    track_dirty_pages: bool,
+) -> Result<(Vec<GuestRegionMmap>, Option<Uffd>), GuestMemoryFromHybridError> {
+    let base_path = mem_backend
+        .base_mem_path
+        .as_ref()
+        .ok_or(GuestMemoryFromHybridError::MissingBase)?;
+    let regions: Vec<_> = mem_state.regions().collect();
+    let base = File::open(base_path)?;
+    let guest_memory = memory::snapshot_file(base, regions.iter().copied(), track_dirty_pages)?;
+    if let Some(dirty_path) = mem_backend.dirty_pages_path.as_ref() {
+        apply_delta(&guest_memory, &mem_backend.backend_path, dirty_path)?;
+    }
+    Ok((guest_memory, None))
+}
+
+/// Write each dirty page (from `delta_path` at its file offset) into the MAP_PRIVATE
+/// guest memory — COW's just that page private, leaving the shared base pristine.
+/// Pure host-side memcpy, runs before resume.
+fn apply_delta(
+    guest_memory: &[GuestRegionMmap],
+    delta_path: &Path,
+    dirty_path: &Path,
+) -> Result<u64, GuestMemoryFromHybridError> {
+    const PS: usize = 4096;
+    let delta = File::open(delta_path)?;
+    let dfd = delta.as_raw_fd();
+    // cumulative (file_offset, host_addr, size) per region
+    let mut cum = Vec::with_capacity(guest_memory.len());
+    let mut off = 0u64;
+    for r in guest_memory {
+        cum.push((off, r.as_ptr() as u64, r.size() as u64));
+        off += r.size() as u64;
+    }
+    let mut offsets: Vec<u64> = io::BufReader::new(File::open(dirty_path)?)
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|l| l.trim().parse::<u64>().ok())
+        .map(|o| o & !((PS as u64) - 1))
+        .collect();
+    offsets.sort_unstable();
+    offsets.dedup();
+    let mut buf = vec![0u8; PS];
+    let mut applied = 0u64;
+    for o in offsets {
+        let Some(&(c, host, _)) = cum.iter().find(|&&(c, _, size)| o >= c && o < c + size)
+        else {
+            continue;
+        };
+        // read the fresh page from the delta file at its guest-memory offset
+        let n = unsafe { libc::pread(dfd, buf.as_mut_ptr().cast(), PS, o as i64) };
+        if n != PS as isize {
+            continue; // hole / short read: nothing to overlay
+        }
+        let dst = (host + (o - c)) as *mut u8;
+        // SAFETY: dst is within this region's MAP_PRIVATE mapping; the write COWs the page.
+        unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), dst, PS) };
+        applied += 1;
+    }
+    Ok(applied)
 }
 
 fn create_minor_uffd() -> Result<Uffd, GuestMemoryFromHybridError> {
