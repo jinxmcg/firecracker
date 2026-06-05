@@ -5,7 +5,7 @@
 
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, Write};
 use std::mem::forget;
 use std::os::fd::FromRawFd;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -720,10 +720,15 @@ fn guest_memory_from_hybrid(
         .as_ref()
         .ok_or(GuestMemoryFromHybridError::MissingBase)?;
 
-    // 1. memfd-backed guest memory (MAP_SHARED) + a dup fd for seeding/handshake.
+    // 1. Map ONE shared shmem base (a tmpfs file, e.g. /dev/shm/base.mem) MAP_PRIVATE.
+    //    Every VM on the node maps the SAME base file, so the clean base pages are
+    //    shared physical pages (COW on write) — one base copy node-wide instead of a
+    //    per-VM 4GB memfd. base_mem_path MUST be tmpfs/shmem so UFFD_MINOR can later
+    //    register over the dirty tail. The file is seeded once per node externally.
     let regions: Vec<_> = mem_state.regions().collect();
-    let (guest_memory, mut seed_fd) =
-        memory::memfd_backed_with_fd(&regions, track_dirty_pages, huge_pages)?;
+    let base = File::open(base_path)?;
+    let base_fd = base.as_raw_fd();
+    let guest_memory = memory::snapshot_file(base, regions.iter().copied(), track_dirty_pages)?;
 
     let mut backend_mappings = Vec::with_capacity(guest_memory.len());
     let mut offset = 0u64;
@@ -739,11 +744,8 @@ fn guest_memory_from_hybrid(
         offset += region.size() as u64;
     }
 
-    // 2. seed the memfd from base via the fd (leaving the mmap PTEs absent, so
-    //    unregistered base pages are minor-faulted-free kernel page-cache hits).
-    let mut base = File::open(base_path)?;
-    seed_fd.seek(SeekFrom::Start(0))?;
-    io::copy(&mut base, &mut seed_fd)?;
+    // 2. (no per-VM seeding — the shared tmpfs base is already populated; clean pages
+    //    are served straight from its page cache, shared COW across all VMs.)
 
     // 3. UFFD with MINOR_SHMEM negotiated.
     let uffd = create_minor_uffd()?;
@@ -753,11 +755,12 @@ fn guest_memory_from_hybrid(
         register_minor_ranges(&uffd, &backend_mappings, dirty_path, huge_pages.page_size())?;
     }
 
-    // 5. handshake: mappings + [uffd fd, memfd fd] to the handler.
+    // 5. handshake: mappings + [uffd fd, shared-base fd] to the handler. The base fd
+    //    is sent for protocol compat; the COPY-based handler no longer writes into it.
     let socket = UnixStream::connect(&mem_backend.backend_path)?;
     let json = serde_json::to_string(&backend_mappings).unwrap();
     socket
-        .send_with_fds(&[json.as_bytes()], &[uffd.as_raw_fd(), seed_fd.as_raw_fd()])
+        .send_with_fds(&[json.as_bytes()], &[uffd.as_raw_fd(), base_fd])
         .map_err(GuestMemoryFromHybridError::Send)?;
     forget(socket);
 
