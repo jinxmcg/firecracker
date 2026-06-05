@@ -31,6 +31,10 @@ pub enum MemBackendType {
     File,
     /// Guest memory will be served through UFFD by a separate process.
     Uffd,
+    /// Hybrid: guest memory is a memfd seeded from a base mem file (kernel-served,
+    /// no fault tax); only the not-yet-arrived dirty pages are registered with
+    /// UFFD_MINOR and served by a separate process via UFFDIO_CONTINUE.
+    Hybrid,
 }
 
 /// Stores the configuration that will be used for creating a snapshot.
@@ -45,6 +49,35 @@ pub struct CreateSnapshotParams {
     pub snapshot_path: PathBuf,
     /// Path to the file that will contain the guest memory.
     pub mem_file_path: PathBuf,
+}
+
+/// Stores the configuration that will be used for creating a state-only snapshot.
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateSnapshotStateParams {
+    /// Path to the file that will contain the microVM state.
+    pub snapshot_path: PathBuf,
+    /// Whether to skip durable storage sync for the state file.
+    #[serde(default)]
+    pub no_sync: bool,
+}
+
+/// Stores the configuration that will be used for exporting only dirty guest memory.
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirtyMemoryParams {
+    /// Path to the file that will receive dirty guest memory pages.
+    pub mem_file_path: PathBuf,
+    /// Whether to sync the exported dirty memory file to durable storage.
+    #[serde(default = "default_dirty_memory_sync")]
+    pub sync: bool,
+    /// Whether to mark virtio queue pages dirty before exporting memory.
+    #[serde(default)]
+    pub mark_virtio_queues: bool,
+}
+
+fn default_dirty_memory_sync() -> bool {
+    true
 }
 
 /// Allows for changing the mapping between tap devices and host devices
@@ -130,6 +163,13 @@ pub struct MemBackendConfig {
     pub backend_path: PathBuf,
     /// Specifies the guest memory backend type.
     pub backend_type: MemBackendType,
+    /// [Hybrid only] Base mem file used to seed the memfd (kernel-served pages).
+    #[serde(default)]
+    pub base_mem_path: Option<PathBuf>,
+    /// [Hybrid only] File of dirty guest page offsets (one u64 per line) to
+    /// register with UFFD_MINOR; everything else is served from the seeded base.
+    #[serde(default)]
+    pub dirty_pages_path: Option<PathBuf>,
 }
 
 /// The microVM state options.

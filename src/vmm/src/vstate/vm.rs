@@ -575,6 +575,16 @@ impl KvmVm {
     ) -> Result<(), CreateSnapshotError> {
         use self::CreateSnapshotError::*;
 
+        // Determine what size our total memory area is.
+        let mem_size_mib = mem_size_mib(self.guest_memory());
+        let expected_size = mem_size_mib * 1024 * 1024;
+
+        if snapshot_type == SnapshotType::Full
+            && std::env::var_os("FIRECRACKER_SPARSE_MEMORY_SNAPSHOT").is_some()
+        {
+            return self.snapshot_memory_to_sparse_file(mem_file_path, expected_size);
+        }
+
         // Need to check this here, as we create the file in the line below
         let file_existed = mem_file_path.exists();
 
@@ -584,10 +594,6 @@ impl KvmVm {
             .truncate(false)
             .open(mem_file_path)
             .map_err(|err| MemoryBackingFile("open", err))?;
-
-        // Determine what size our total memory area is.
-        let mem_size_mib = mem_size_mib(self.guest_memory());
-        let expected_size = mem_size_mib * 1024 * 1024;
 
         if file_existed {
             let file_size = file
@@ -628,6 +634,75 @@ impl KvmVm {
             .map_err(|err| MemoryBackingFile("flush", err))?;
         file.sync_all()
             .map_err(|err| MemoryBackingFile("sync_all", err))
+    }
+
+    /// Exports currently dirty guest memory pages without requiring the vCPUs to be paused.
+    pub(crate) fn export_dirty_memory_to_file(
+        &self,
+        mem_file_path: &Path,
+        sync: bool,
+    ) -> Result<(), CreateSnapshotError> {
+        use self::CreateSnapshotError::*;
+
+        let mem_size_mib = mem_size_mib(self.guest_memory());
+        let expected_size = mem_size_mib * 1024 * 1024;
+
+        // The dirty export is a partial (sparse) write: dump_dirty writes only the
+        // currently-dirty pages and seeks over the rest, leaving holes. Unlike a
+        // load-backing memory file, the export target is NEVER the live mmap, so it
+        // is always safe to clear it first -- and we MUST, unconditionally. If a
+        // caller reuses a same-size path across cutovers, any page that was dirty in
+        // a previous export but clean now would otherwise retain its STALE content
+        // (dump_dirty does not zero skipped pages), and a layered base+delta restore
+        // would serve that stale page -> guest memory corruption. truncate(true)
+        // releases the old blocks; set_len re-establishes a fully-sparse file.
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(mem_file_path)
+            .map_err(|err| MemoryBackingFile("open_dirty_export", err))?;
+
+        file.set_len(expected_size)
+            .map_err(|e| MemoryBackingFile("set_dirty_export_length", e))?;
+
+        let dirty_bitmap = self.get_dirty_bitmap()?;
+        self.guest_memory().dump_dirty(&mut file, &dirty_bitmap)?;
+
+        file.flush()
+            .map_err(|err| MemoryBackingFile("flush_dirty_export", err))?;
+        if sync {
+            file.sync_all()
+                .map_err(|err| MemoryBackingFile("sync_dirty_export", err))?;
+        }
+        Ok(())
+    }
+
+    fn snapshot_memory_to_sparse_file(
+        &self,
+        mem_file_path: &Path,
+        expected_size: u64,
+    ) -> Result<(), CreateSnapshotError> {
+        use self::CreateSnapshotError::*;
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(mem_file_path)
+            .map_err(|err| MemoryBackingFile("open_sparse", err))?;
+
+        file.set_len(expected_size)
+            .map_err(|e| MemoryBackingFile("set_sparse_length", e))?;
+
+        self.guest_memory().dump_sparse(&mut file)?;
+        self.reset_dirty_bitmap();
+        self.guest_memory().reset_dirty();
+
+        file.flush()
+            .map_err(|err| MemoryBackingFile("flush_sparse", err))?;
+        file.sync_all()
+            .map_err(|err| MemoryBackingFile("sync_sparse", err))
     }
 
     /// Register a device IRQ

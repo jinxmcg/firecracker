@@ -460,6 +460,9 @@ impl Vmm {
 
     /// Sends a resume command to the vCPUs.
     pub fn resume_vm(&mut self) -> Result<(), VmmError> {
+        if std::env::var_os("FIRECRACKER_TANGO_NET_TRACE").is_some() {
+            info_unrestricted!("tango-net-trace event=vmm_resume_start");
+        }
         let kvm_vm = self
             .vm
             .as_kvm()
@@ -467,17 +470,53 @@ impl Vmm {
         self.device_manager.kick_virtio_devices();
         kvm_vm.resume_vcpus()?;
         self.instance_info.state = VmState::Running;
+        if std::env::var_os("FIRECRACKER_TANGO_NET_TRACE").is_some() {
+            info_unrestricted!("tango-net-trace event=vmm_resume_done");
+        }
         Ok(())
     }
 
     /// Sends a pause command to the vCPUs.
     pub fn pause_vm(&mut self) -> Result<(), VmmError> {
+        if std::env::var_os("FIRECRACKER_TANGO_NET_TRACE").is_some() {
+            info_unrestricted!("tango-net-trace event=vmm_pause_start");
+        }
         let kvm_vm = self
             .vm
             .as_kvm()
             .ok_or_else(|| VmmError::NotSupportedOnVmType(self.vm.type_name()))?;
         kvm_vm.pause_vcpus()?;
         self.instance_info.state = VmState::Paused;
+        if std::env::var_os("FIRECRACKER_TANGO_NET_TRACE").is_some() {
+            info_unrestricted!("tango-net-trace event=vmm_pause_done");
+        }
+        Ok(())
+    }
+
+    /// Exports dirty guest memory pages without pausing vCPUs.
+    pub fn export_dirty_memory(
+        &mut self,
+        mem_file_path: &std::path::Path,
+        sync: bool,
+        mark_virtio_queues: bool,
+    ) -> Result<(), persist::CreateSnapshotError> {
+        let kvm_vm = self.vm.as_kvm().ok_or_else(|| {
+            persist::CreateSnapshotError::MicrovmState(persist::MicrovmStateError::NotAllowed(
+                "dirty memory export requires KVM".into(),
+            ))
+        })?;
+
+        if mark_virtio_queues {
+            self.device_manager
+                .mark_virtio_queue_memory_dirty(kvm_vm.guest_memory());
+        }
+
+        kvm_vm.export_dirty_memory_to_file(mem_file_path, sync)?;
+
+        // Keep queue pages dirty for the final paused device-state snapshot.
+        self.device_manager
+            .mark_virtio_queue_memory_dirty(kvm_vm.guest_memory());
+
         Ok(())
     }
 

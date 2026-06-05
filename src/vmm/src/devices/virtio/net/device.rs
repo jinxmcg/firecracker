@@ -39,7 +39,7 @@ use crate::devices::{DeviceError, report_net_event_fail};
 use crate::dumbo::pdu::arp::ETH_IPV4_FRAME_LEN;
 use crate::dumbo::pdu::ethernet::{EthernetFrame, PAYLOAD_OFFSET};
 use crate::impl_device_type;
-use crate::logger::{IncMetric, METRICS, error};
+use crate::logger::{IncMetric, METRICS, error, info_unrestricted};
 use crate::mmds::data_store::Mmds;
 use crate::mmds::ns::MmdsNetworkStack;
 use crate::rate_limiter::{BucketUpdate, RateLimiter, TokenType};
@@ -58,6 +58,11 @@ pub(crate) const fn vnet_hdr_len() -> usize {
 // the header IPv4 ARP header which is 28 bytes long.
 const fn frame_hdr_len() -> usize {
     vnet_hdr_len() + FRAME_HEADER_MAX_LEN
+}
+
+#[inline]
+fn tango_net_trace_enabled() -> bool {
+    std::env::var_os("FIRECRACKER_TANGO_NET_TRACE").is_some()
 }
 
 // Frames being sent/received through the network device model have a VNET header. This
@@ -685,6 +690,17 @@ impl Net {
                     self.metrics.rx_count.inc();
                     self.metrics.rx_bytes_count.add(bytes as u64);
                     self.metrics.rx_packets_count.inc();
+                    if tango_net_trace_enabled() {
+                        info_unrestricted!(
+                            "tango-net-trace id={} tap={} event=rx_frame bytes={} rx_buffer_capacity={} rx_used_descriptors={} rx_used_bytes={}",
+                            self.id,
+                            self.iface_name(),
+                            bytes,
+                            self.rx_buffer.capacity(),
+                            self.rx_buffer.used_descriptors,
+                            self.rx_buffer.used_bytes
+                        );
+                    }
                     if !self.rate_limited_rx_single_frame(bytes) {
                         break;
                     }
@@ -737,6 +753,17 @@ impl Net {
         // with the MMDS network stack.
         let mut process_rx_for_mmds = false;
         let mut used_any = false;
+        let trace_enabled = tango_net_trace_enabled();
+        let trace_id = if trace_enabled {
+            Some(self.id.clone())
+        } else {
+            None
+        };
+        let trace_tap = if trace_enabled {
+            Some(self.iface_name())
+        } else {
+            None
+        };
         let tx_queue = &mut self.queues[TX_INDEX];
 
         while let Some(head) = tx_queue.pop_or_enable_notification()? {
@@ -781,6 +808,16 @@ impl Net {
                 &self.metrics,
             )
             .unwrap_or(false);
+            if trace_enabled {
+                info_unrestricted!(
+                    "tango-net-trace id={} tap={} event=tx_frame bytes={} mmds_consumed={} tx_queue_len={}",
+                    trace_id.as_deref().unwrap_or(""),
+                    trace_tap.as_deref().unwrap_or(""),
+                    self.tx_buffer.len(),
+                    frame_consumed_by_mmds,
+                    tx_queue.len()
+                );
+            }
             if frame_consumed_by_mmds && self.rx_buffer.used_bytes == 0 {
                 // MMDS consumed this frame/request, let's also try to process the response.
                 process_rx_for_mmds = true;

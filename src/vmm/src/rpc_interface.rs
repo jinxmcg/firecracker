@@ -43,7 +43,10 @@ use crate::vmm_config::net::{
 };
 use crate::vmm_config::pmem::{PmemConfig, PmemConfigError, PmemDeviceUpdateConfig};
 use crate::vmm_config::serial::SerialConfig;
-use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, SnapshotType};
+use crate::vmm_config::snapshot::{
+    CreateSnapshotParams, CreateSnapshotStateParams, DirtyMemoryParams, LoadSnapshotParams,
+    SnapshotType,
+};
 use crate::vmm_config::vsock::{VsockConfigError, VsockDeviceConfig};
 use crate::vmm_config::{self, RateLimiterUpdate};
 
@@ -65,6 +68,10 @@ pub enum VmmAction {
     /// Create a snapshot using as input the `CreateSnapshotParams`. This action can only be called
     /// after the microVM has booted and only when the microVM is in `Paused` state.
     CreateSnapshot(CreateSnapshotParams),
+    /// Create only the microVM state file without writing guest memory.
+    CreateSnapshotState(CreateSnapshotStateParams),
+    /// Export only dirty guest memory pages while the microVM is running.
+    ExportDirtyMemory(DirtyMemoryParams),
     /// Get the balloon device configuration.
     GetBalloonConfig,
     /// Get the ballon device latest statistics.
@@ -501,6 +508,8 @@ impl<'a> PrebootApiController<'a> {
             SetMemoryHotplugDevice(config) => self.set_memory_hotplug_device(config),
             // Operations not allowed pre-boot.
             CreateSnapshot(_)
+            | CreateSnapshotState(_)
+            | ExportDirtyMemory(_)
             | FlushMetrics
             | Pause
             | Resume
@@ -703,6 +712,10 @@ impl RuntimeApiController {
         match request {
             // Supported operations allowed post-boot.
             CreateSnapshot(snapshot_create_cfg) => self.create_snapshot(&snapshot_create_cfg),
+            CreateSnapshotState(snapshot_create_cfg) => {
+                self.create_state_snapshot(&snapshot_create_cfg)
+            }
+            ExportDirtyMemory(dirty_memory_cfg) => self.export_dirty_memory(&dirty_memory_cfg),
             FlushMetrics => self.flush_metrics(),
             GetBalloonConfig => self
                 .vmm
@@ -953,6 +966,48 @@ impl RuntimeApiController {
                 );
             }
         }
+        Ok(VmmData::Empty)
+    }
+
+    fn create_state_snapshot(
+        &mut self,
+        create_params: &CreateSnapshotStateParams,
+    ) -> Result<VmmData, VmmActionError> {
+        log_dev_preview_warning("Virtual machine state-only snapshots", None);
+
+        let mut locked_vmm = self.vmm.lock().unwrap();
+        let vm_info = VmInfo::from(&*locked_vmm);
+        let create_start_us = get_time_us(ClockType::Monotonic);
+
+        crate::persist::create_state_snapshot(&mut locked_vmm, &vm_info, create_params)?;
+
+        let elapsed_time_us = update_metric_with_elapsed_time(
+            &METRICS.latencies_us.vmm_diff_create_snapshot,
+            create_start_us,
+        );
+        info!(
+            "'create state-only snapshot' VMM action took {} us.",
+            elapsed_time_us
+        );
+
+        Ok(VmmData::Empty)
+    }
+
+    fn export_dirty_memory(
+        &mut self,
+        dirty_memory_params: &DirtyMemoryParams,
+    ) -> Result<VmmData, VmmActionError> {
+        log_dev_preview_warning("Live dirty memory export", None);
+
+        self.vmm
+            .lock()
+            .expect("Poisoned lock")
+            .export_dirty_memory(
+                &dirty_memory_params.mem_file_path,
+                dirty_memory_params.sync,
+                dirty_memory_params.mark_virtio_queues,
+            )?;
+
         Ok(VmmData::Empty)
     }
 

@@ -559,6 +559,27 @@ pub fn memfd_backed(
     )
 }
 
+/// Like [`memfd_backed`], but also returns a duplicate of the backing memfd
+/// `File` so the caller can seed it from a base image and hand it to a
+/// UFFD_MINOR page-fault handler. Used by the Hybrid snapshot backend.
+pub fn memfd_backed_with_fd(
+    regions: &[(GuestAddress, usize)],
+    track_dirty_pages: bool,
+    huge_pages: HugePageConfig,
+) -> Result<(Vec<GuestRegionMmap>, File), MemoryError> {
+    let size = regions.iter().map(|&(_, size)| size as u64).sum();
+    let memfd_file = create_memfd(size, huge_pages.into())?.into_file();
+    let seed_fd = memfd_file.try_clone().map_err(MemoryError::FileMetadata)?;
+
+    let guest_memory = create(
+        regions.iter().copied(),
+        libc::MAP_SHARED | huge_pages.mmap_flags(),
+        Some(memfd_file),
+        track_dirty_pages,
+    )?;
+    Ok((guest_memory, seed_fd))
+}
+
 /// Creates a GuestMemoryMmap from raw regions.
 pub fn anonymous(
     regions: impl Iterator<Item = (GuestAddress, usize)>,
@@ -614,6 +635,12 @@ where
 
     /// Dumps all contents of GuestMemoryMmap to a writer.
     fn dump<T: WriteVolatile + std::io::Seek>(&self, writer: &mut T) -> Result<(), MemoryError>;
+
+    /// Dumps all contents of GuestMemoryMmap, seeking over zero pages to create holes.
+    fn dump_sparse<T: WriteVolatile + std::io::Seek>(
+        &self,
+        writer: &mut T,
+    ) -> Result<(), MemoryError>;
 
     /// Dumps all pages of GuestMemoryMmap present in `dirty_bitmap` to a writer.
     fn dump_dirty<T: WriteVolatile + std::io::Seek>(
@@ -711,6 +738,69 @@ impl GuestMemoryExtension for GuestMemoryMmap {
                 Ok(())
             })
             .map_err(MemoryError::WriteMemory)
+    }
+
+    /// Dumps all contents of GuestMemoryMmap, seeking over zero pages to create holes.
+    fn dump_sparse<T: WriteVolatile + std::io::Seek>(
+        &self,
+        writer: &mut T,
+    ) -> Result<(), MemoryError> {
+        let page_size = host_page_size();
+
+        self.iter()
+            .flat_map(|region| region.slots())
+            .try_for_each(|(mem_slot, plugged)| {
+                if !plugged {
+                    let ilen = i64::try_from(mem_slot.slice.len())
+                        .map_err(|_| MemoryError::SlotSizeTooLarge)?;
+                    writer
+                        .seek(SeekFrom::Current(ilen))
+                        .map_err(MemoryError::SeekError)?;
+                    return Ok(());
+                }
+
+                let mut page_start = 0;
+                let mut write_start = 0;
+                let mut write_size = 0;
+
+                while page_start < mem_slot.slice.len() {
+                    let page_len = std::cmp::min(page_size, mem_slot.slice.len() - page_start);
+                    let page = mem_slot.slice.subslice(page_start, page_len)?;
+
+                    if volatile_slice_is_zero(&page) {
+                        if write_size > 0 {
+                            writer
+                                .write_all_volatile(
+                                    &mem_slot.slice.subslice(write_start, write_size)?,
+                                )
+                                .map_err(MemoryError::VolatileMemoryError)?;
+                            write_size = 0;
+                        }
+
+                        writer
+                            .seek(SeekFrom::Current(
+                                i64::try_from(page_len)
+                                    .map_err(|_| MemoryError::SlotSizeTooLarge)?,
+                            ))
+                            .map_err(MemoryError::SeekError)?;
+                    } else {
+                        if write_size == 0 {
+                            write_start = page_start;
+                        }
+                        write_size += page_len;
+                    }
+
+                    page_start += page_len;
+                }
+
+                if write_size > 0 {
+                    writer
+                        .write_all_volatile(&mem_slot.slice.subslice(write_start, write_size)?)
+                        .map_err(MemoryError::VolatileMemoryError)?;
+                }
+
+                Ok(())
+            })
     }
 
     /// Dumps all pages of GuestMemoryMmap present in `dirty_bitmap` to a writer.
@@ -822,6 +912,12 @@ impl GuestMemoryExtension for GuestMemoryMmap {
             region.discard_range(start, len)
         })
     }
+}
+
+fn volatile_slice_is_zero<B: BitmapSlice>(slice: &VolatileSlice<B>) -> bool {
+    let guard = slice.ptr_guard();
+    let bytes = unsafe { std::slice::from_raw_parts(guard.as_ptr(), slice.len()) };
+    bytes.iter().all(|byte| *byte == 0)
 }
 
 fn create_memfd(

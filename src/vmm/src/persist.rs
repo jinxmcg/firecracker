@@ -5,16 +5,17 @@
 
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufRead, Seek, SeekFrom, Write};
 use std::mem::forget;
-use std::os::unix::io::AsRawFd;
+use std::os::fd::FromRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use userfaultfd::{FeatureFlags, Uffd, UffdBuilder};
+use userfaultfd::{FeatureFlags, RegisterMode, Uffd, UffdBuilder};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 #[cfg(target_arch = "aarch64")]
@@ -34,7 +35,10 @@ use crate::utils::u64_to_usize;
 use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, MachineConfigUpdate};
-use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
+use crate::vmm_config::snapshot::{
+    CreateSnapshotParams, CreateSnapshotStateParams, LoadSnapshotParams, MemBackendConfig,
+    MemBackendType,
+};
 use crate::vstate::kvm::KvmState;
 use crate::vstate::memory::{
     self, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
@@ -172,7 +176,7 @@ pub fn create_snapshot(
         .save_state(vm_info)
         .map_err(CreateSnapshotError::MicrovmState)?;
 
-    snapshot_state_to_file(&microvm_state, &params.snapshot_path)?;
+    snapshot_state_to_file(&microvm_state, &params.snapshot_path, false)?;
 
     let kvm_vm = vmm.vm.as_kvm().ok_or_else(|| {
         CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
@@ -190,9 +194,23 @@ pub fn create_snapshot(
     Ok(())
 }
 
+/// Creates a Microvm state-only snapshot.
+pub fn create_state_snapshot(
+    vmm: &mut Vmm,
+    vm_info: &VmInfo,
+    params: &CreateSnapshotStateParams,
+) -> Result<(), CreateSnapshotError> {
+    let microvm_state = vmm
+        .save_state(vm_info)
+        .map_err(CreateSnapshotError::MicrovmState)?;
+
+    snapshot_state_to_file(&microvm_state, &params.snapshot_path, params.no_sync)
+}
+
 fn snapshot_state_to_file(
     microvm_state: &MicrovmState,
     snapshot_path: &Path,
+    no_sync: bool,
 ) -> Result<(), CreateSnapshotError> {
     use self::CreateSnapshotError::*;
     let mut snapshot_file = OpenOptions::new()
@@ -207,6 +225,9 @@ fn snapshot_state_to_file(
     snapshot_file
         .flush()
         .map_err(|err| SnapshotBackingFile("flush", err))?;
+    if no_sync {
+        return Ok(());
+    }
     snapshot_file
         .sync_all()
         .map_err(|err| SnapshotBackingFile("sync_all", err))
@@ -356,6 +377,8 @@ pub enum RestoreFromSnapshotGuestMemoryError {
     File(#[from] GuestMemoryFromFileError),
     /// Error creating guest memory from uffd: {0}
     Uffd(#[from] GuestMemoryFromUffdError),
+    /// Error creating guest memory from hybrid: {0}
+    Hybrid(#[from] GuestMemoryFromHybridError),
 }
 
 /// Loads a Microvm snapshot producing a 'paused' Microvm.
@@ -461,6 +484,13 @@ pub fn restore_from_snapshot(
             vm_resources.machine_config.huge_pages,
         )
         .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
+        MemBackendType::Hybrid => guest_memory_from_hybrid(
+            &params.mem_backend,
+            mem_state,
+            track_dirty_pages,
+            vm_resources.machine_config.huge_pages,
+        )
+        .map_err(RestoreFromSnapshotGuestMemoryError::Hybrid)?,
     };
     builder::build_microvm_from_snapshot(
         instance_info,
@@ -641,6 +671,161 @@ fn send_uffd_handshake(
     forget(socket);
 
     Ok(())
+}
+
+// ---------- Hybrid backend (memfd base + UFFD_MINOR for the dirty tail) ----------
+
+// Raw userfaultfd uapi: the safe `UffdBuilder` cannot negotiate MINOR_SHMEM
+// (the crate's FeatureFlags don't expose it), so we do the UFFDIO_API by hand.
+const UFFD_API: u64 = 0xAA;
+const UFFDIO_API: libc::c_ulong = 0xC018_AA3F;
+const UFFD_FEATURE_EVENT_REMOVE: u64 = 1 << 3;
+const UFFD_FEATURE_MINOR_SHMEM: u64 = 1 << 10;
+
+#[repr(C)]
+struct UffdioApi {
+    api: u64,
+    features: u64,
+    ioctls: u64,
+}
+
+/// Error type for [`guest_memory_from_hybrid`].
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+pub enum GuestMemoryFromHybridError {
+    /// Hybrid backend requires `base_mem_path`
+    MissingBase,
+    /// Failed to restore guest memory: {0}
+    Restore(#[from] MemoryError),
+    /// Hybrid memfd/base I/O error: {0}
+    Io(#[from] std::io::Error),
+    /// Failed to create UFFD: {0}
+    Uffd(std::io::Error),
+    /// Failed to register UFFD_MINOR range: {0}
+    Register(userfaultfd::Error),
+    /// Failed to send fds to handler: {0}
+    Send(vmm_sys_util::errno::Error),
+}
+
+/// Hybrid restore: back guest RAM with a memfd seeded from the base image
+/// (kernel-served, no fault tax) and register UFFD_MINOR over only the dirty
+/// pages, served by an external handler via UFFDIO_CONTINUE.
+fn guest_memory_from_hybrid(
+    mem_backend: &MemBackendConfig,
+    mem_state: &GuestMemoryState,
+    track_dirty_pages: bool,
+    huge_pages: HugePageConfig,
+) -> Result<(Vec<GuestRegionMmap>, Option<Uffd>), GuestMemoryFromHybridError> {
+    let base_path = mem_backend
+        .base_mem_path
+        .as_ref()
+        .ok_or(GuestMemoryFromHybridError::MissingBase)?;
+
+    // 1. memfd-backed guest memory (MAP_SHARED) + a dup fd for seeding/handshake.
+    let regions: Vec<_> = mem_state.regions().collect();
+    let (guest_memory, mut seed_fd) =
+        memory::memfd_backed_with_fd(&regions, track_dirty_pages, huge_pages)?;
+
+    let mut backend_mappings = Vec::with_capacity(guest_memory.len());
+    let mut offset = 0u64;
+    for region in guest_memory.iter() {
+        #[allow(deprecated)]
+        backend_mappings.push(GuestRegionUffdMapping {
+            base_host_virt_addr: region.as_ptr() as u64,
+            size: region.size(),
+            offset,
+            page_size: huge_pages.page_size(),
+            page_size_kib: huge_pages.page_size(),
+        });
+        offset += region.size() as u64;
+    }
+
+    // 2. seed the memfd from base via the fd (leaving the mmap PTEs absent, so
+    //    unregistered base pages are minor-faulted-free kernel page-cache hits).
+    let mut base = File::open(base_path)?;
+    seed_fd.seek(SeekFrom::Start(0))?;
+    io::copy(&mut base, &mut seed_fd)?;
+
+    // 3. UFFD with MINOR_SHMEM negotiated.
+    let uffd = create_minor_uffd()?;
+
+    // 4. register UFFD_MINOR over only the dirty pages (everything else is base).
+    if let Some(dirty_path) = mem_backend.dirty_pages_path.as_ref() {
+        register_minor_ranges(&uffd, &backend_mappings, dirty_path, huge_pages.page_size())?;
+    }
+
+    // 5. handshake: mappings + [uffd fd, memfd fd] to the handler.
+    let socket = UnixStream::connect(&mem_backend.backend_path)?;
+    let json = serde_json::to_string(&backend_mappings).unwrap();
+    socket
+        .send_with_fds(&[json.as_bytes()], &[uffd.as_raw_fd(), seed_fd.as_raw_fd()])
+        .map_err(GuestMemoryFromHybridError::Send)?;
+    forget(socket);
+
+    Ok((guest_memory, Some(uffd)))
+}
+
+fn create_minor_uffd() -> Result<Uffd, GuestMemoryFromHybridError> {
+    // SAFETY: simple syscall wrappers; the fd is owned by the returned Uffd.
+    let raw = unsafe { libc::syscall(libc::SYS_userfaultfd, libc::O_CLOEXEC | libc::O_NONBLOCK) };
+    if raw < 0 {
+        return Err(GuestMemoryFromHybridError::Uffd(io::Error::last_os_error()));
+    }
+    let raw = raw as RawFd;
+    let mut api = UffdioApi {
+        api: UFFD_API,
+        features: UFFD_FEATURE_MINOR_SHMEM | UFFD_FEATURE_EVENT_REMOVE,
+        ioctls: 0,
+    };
+    let ret = unsafe { libc::ioctl(raw, UFFDIO_API, &mut api as *mut UffdioApi) };
+    if ret != 0 {
+        let err = io::Error::last_os_error();
+        unsafe { libc::close(raw) };
+        return Err(GuestMemoryFromHybridError::Uffd(err));
+    }
+    Ok(unsafe { Uffd::from_raw_fd(raw) })
+}
+
+fn register_minor_ranges(
+    uffd: &Uffd,
+    mappings: &[GuestRegionUffdMapping],
+    dirty_path: &Path,
+    page_size: usize,
+) -> Result<u64, GuestMemoryFromHybridError> {
+    let ps = page_size as u64;
+    let file = File::open(dirty_path)?;
+    let mut offsets: Vec<u64> = io::BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|l| l.trim().parse::<u64>().ok())
+        .map(|o| o & !(ps - 1))
+        .collect();
+    offsets.sort_unstable();
+    offsets.dedup();
+
+    let mut registered = 0u64;
+    let mut i = 0;
+    while i < offsets.len() {
+        // coalesce a run of consecutive pages
+        let start = offsets[i];
+        let mut end = start + ps;
+        let mut j = i + 1;
+        while j < offsets.len() && offsets[j] == end {
+            end += ps;
+            j += 1;
+        }
+        if let Some(m) = mappings
+            .iter()
+            .find(|m| start >= m.offset && start < m.offset + m.size as u64)
+        {
+            let end = end.min(m.offset + m.size as u64); // clamp to this region
+            let addr = (m.base_host_virt_addr + (start - m.offset)) as *mut libc::c_void;
+            uffd.register_with_mode(addr, (end - start) as usize, RegisterMode::MINOR)
+                .map_err(GuestMemoryFromHybridError::Register)?;
+            registered += (end - start) / ps;
+        }
+        i = j;
+    }
+    Ok(registered)
 }
 
 #[cfg(test)]

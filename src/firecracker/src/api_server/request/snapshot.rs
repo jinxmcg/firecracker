@@ -5,8 +5,8 @@ use serde::de::Error as DeserializeError;
 use vmm::logger::{IncMetric, METRICS};
 use vmm::rpc_interface::VmmAction;
 use vmm::vmm_config::snapshot::{
-    CreateSnapshotParams, LoadSnapshotConfig, LoadSnapshotParams, MemBackendConfig, MemBackendType,
-    Vm, VmState,
+    CreateSnapshotParams, CreateSnapshotStateParams, DirtyMemoryParams, LoadSnapshotConfig,
+    LoadSnapshotParams, MemBackendConfig, MemBackendType, Vm, VmState,
 };
 
 use super::super::parsed_request::{ParsedRequest, RequestError};
@@ -30,6 +30,8 @@ pub(crate) fn parse_put_snapshot(
     match request_type_from_path {
         Some(request_type) => match request_type {
             "create" => parse_put_snapshot_create(body),
+            "create-state" => parse_put_snapshot_create_state(body),
+            "dirty-memory" => parse_put_snapshot_dirty_memory(body),
             "load" => parse_put_snapshot_load(body),
             _ => Err(RequestError::InvalidPathMethod(
                 format!("/snapshot/{}", request_type),
@@ -56,6 +58,20 @@ fn parse_put_snapshot_create(body: &Body) -> Result<ParsedRequest, RequestError>
     let snapshot_config = serde_json::from_slice::<CreateSnapshotParams>(body.raw())?;
     Ok(ParsedRequest::new_sync(VmmAction::CreateSnapshot(
         snapshot_config,
+    )))
+}
+
+fn parse_put_snapshot_create_state(body: &Body) -> Result<ParsedRequest, RequestError> {
+    let snapshot_config = serde_json::from_slice::<CreateSnapshotStateParams>(body.raw())?;
+    Ok(ParsedRequest::new_sync(VmmAction::CreateSnapshotState(
+        snapshot_config,
+    )))
+}
+
+fn parse_put_snapshot_dirty_memory(body: &Body) -> Result<ParsedRequest, RequestError> {
+    let dirty_memory_config = serde_json::from_slice::<DirtyMemoryParams>(body.raw())?;
+    Ok(ParsedRequest::new_sync(VmmAction::ExportDirtyMemory(
+        dirty_memory_config,
     )))
 }
 
@@ -98,6 +114,8 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
                 // either `mem_file_path` or `mem_backend` field is always specified.
                 backend_path: snapshot_config.mem_file_path.unwrap(),
                 backend_type: MemBackendType::File,
+                base_mem_path: None,
+                dirty_pages_path: None,
             }
         }
     };
@@ -165,6 +183,20 @@ mod tests {
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
             VmmAction::CreateSnapshot(expected_config)
+        );
+
+        let body = r#"{
+            "snapshot_path": "foo"
+        }"#;
+        let expected_config = CreateSnapshotStateParams {
+            snapshot_path: PathBuf::from("foo"),
+            no_sync: false,
+        };
+        assert_eq!(
+            vmm_action_from_request(
+                parse_put_snapshot(&Body::new(body), Some("create-state")).unwrap()
+            ),
+            VmmAction::CreateSnapshotState(expected_config)
         );
 
         let invalid_body = r#"{

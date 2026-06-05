@@ -7,7 +7,12 @@ use vmm_sys_util::epoll::EventSet;
 use crate::devices::virtio::device::VirtioDevice;
 use crate::devices::virtio::net::device::Net;
 use crate::devices::virtio::net::{RX_INDEX, TX_INDEX};
-use crate::logger::{IncMetric, error, warn};
+use crate::logger::{IncMetric, error, info_unrestricted, warn};
+
+#[inline]
+fn tango_net_trace_enabled() -> bool {
+    std::env::var_os("FIRECRACKER_TANGO_NET_TRACE").is_some()
+}
 
 impl Net {
     const PROCESS_ACTIVATE: u32 = 0;
@@ -84,6 +89,16 @@ impl MutEventSubscriber for Net {
     fn process(&mut self, event: Events, ops: &mut EventOps) {
         let source = event.data();
         let event_set = event.event_set();
+        if tango_net_trace_enabled() {
+            info_unrestricted!(
+                "tango-net-trace id={} tap={} event=event_manager source={} event_set={:?} activated={}",
+                self.id,
+                self.iface_name(),
+                source,
+                event_set,
+                self.is_activated()
+            );
+        }
 
         // TODO: also check for errors. Pending high level discussions on how we want
         // to handle errors in devices.
