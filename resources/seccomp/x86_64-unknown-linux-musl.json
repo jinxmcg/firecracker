@@ -562,6 +562,18 @@
                         "index": 1,
                         "type": "dword",
                         "op": "eq",
+                        "val": 44743,
+                        "comment": "KVM_RESET_DIRTY_RINGS = _IO(KVMIO, 0xc7) = 0xaec7; dirty-ring harvest re-protect"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
                         "val": 3255348834,
                         "comment": "KVM_GET_IRQCHIP"
                     }
@@ -1184,6 +1196,18 @@
                         "op": "eq",
                         "val": 44672,
                         "comment": "KVM_RUN"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 44743,
+                        "comment": "KVM_RESET_DIRTY_RINGS = 0xaec7; vCPU mid-round KVM_EXIT_DIRTY_RING_FULL harvest re-protect"
                     }
                 ]
             },

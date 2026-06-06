@@ -27,10 +27,11 @@ use vmm_sys_util::terminal::Terminal;
 
 use crate::arch::{GSI_MSI_END, host_page_size};
 pub use crate::arch::{KvmVm, KvmVmError, VmState};
-use crate::logger::{debug, info};
+use crate::logger::{debug, info, warn};
 use crate::persist::CreateSnapshotError;
 use crate::vmm_config::snapshot::SnapshotType;
 use crate::vstate::bus::Bus;
+use crate::vstate::dirty_ring::{self, DirtyRingState};
 use crate::vstate::interrupts::{InterruptError, MsixVector, MsixVectorConfig, MsixVectorGroup};
 use crate::vstate::kvm::Kvm;
 use crate::vstate::memory::{
@@ -80,6 +81,10 @@ pub struct VmCommon {
     pub vcpus_handles: Mutex<Vec<VcpuHandle>>,
     /// Event fd written to by vCPUs on exit.
     pub vcpus_exit_evt: EventFd,
+    /// Per-vCPU KVM dirty rings, when the host supports them. `None` falls back to the
+    /// classic `KVM_GET_DIRTY_LOG` bitmap path. Shared with the vCPU threads so they can
+    /// harvest on `KVM_EXIT_DIRTY_RING_FULL`.
+    pub dirty_ring: Option<Arc<DirtyRingState>>,
 }
 
 /// Errors associated with the wrappers over KVM ioctls.
@@ -109,6 +114,8 @@ pub enum VmError {
     ResourceAllocator(#[from] vm_allocator::Error),
     /// MemoryError error: {0}
     MemoryError(#[from] MemoryError),
+    /// Dirty ring error: {0}
+    DirtyRing(#[from] dirty_ring::DirtyRingError),
 }
 
 /// VM abstraction: either a KVM-based VM or (in the future) a Nitro Enclave.
@@ -176,6 +183,11 @@ impl KvmVm {
 
         let vcpus_exit_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(VmError::EventFd)?;
 
+        // Enable the per-vCPU dirty ring before any vCPU or memslot is created (KVM
+        // requires this ordering). Falls back to `None` (classic bitmap path) on hosts
+        // that lack the capability, so older hosts never regress.
+        let dirty_ring = dirty_ring::enable(&fd, &kvm.fd).map(Arc::new);
+
         Ok(VmCommon {
             fd,
             max_memslots: kvm.max_nr_memslots(),
@@ -188,6 +200,7 @@ impl KvmVm {
             uffd: None,
             vcpus_handles: Mutex::new(Vec::new()),
             vcpus_exit_evt,
+            dirty_ring,
         })
     }
 
@@ -203,7 +216,15 @@ impl KvmVm {
                 .vcpus_exit_evt()
                 .try_clone()
                 .map_err(VmError::EventFd)?;
-            let vcpu = Vcpu::new(cpu_idx, self, exit_evt).map_err(VmError::CreateVcpu)?;
+            let mut vcpu = Vcpu::new(cpu_idx, self, exit_evt).map_err(VmError::CreateVcpu)?;
+            // Map this vCPU's dirty ring (if enabled) and hand it a reference so it can
+            // harvest on `KVM_EXIT_DIRTY_RING_FULL`. Mapping failure is fatal: the ring
+            // is already active in KVM, so an unmapped ring would silently drop pages.
+            if let Some(dirty_ring) = self.common.dirty_ring.as_ref() {
+                use std::os::fd::AsRawFd;
+                dirty_ring.add_vcpu_ring(vcpu.kvm_vcpu.fd.as_raw_fd())?;
+                vcpu.set_dirty_ring(Arc::clone(dirty_ring));
+            }
             vcpus.push(vcpu);
         }
 
@@ -533,6 +554,23 @@ impl KvmVm {
 
     /// Resets the KVM dirty bitmap for each of the guest's memory regions.
     pub fn reset_dirty_bitmap(&self) {
+        if let Some(dirty_ring) = self.common.dirty_ring.as_ref() {
+            // Harvest + `KVM_RESET_DIRTY_RINGS` re-protects every dirtied GFN and clears
+            // the accumulator, discarding the result.
+            let _ = dirty_ring.collect();
+            // With WITH_BITMAP, also clear the supplementary (non-vCPU) bitmap.
+            if dirty_ring.with_bitmap {
+                self.guest_memory()
+                    .iter()
+                    .flat_map(|region| region.plugged_slots())
+                    .filter(|mem_slot| mem_slot.slice.bitmap().is_some())
+                    .for_each(|mem_slot| {
+                        let _ = self.fd().get_dirty_log(mem_slot.slot, mem_slot.slice.len());
+                    });
+            }
+            return;
+        }
+
         self.guest_memory()
             .iter()
             .flat_map(|region| region.plugged_slots())
@@ -542,7 +580,66 @@ impl KvmVm {
     }
 
     /// Retrieves the KVM dirty bitmap for each of the guest's memory regions.
+    ///
+    /// When the per-vCPU dirty ring is active, the vCPU-dirtied pages come from draining
+    /// the rings (cheap, no global re-protect) rather than the classic
+    /// `KVM_GET_DIRTY_LOG` bitmap scan. The returned `slot -> Vec<u64>` shape is
+    /// identical, so `dump_dirty` and every downstream consumer are unchanged.
     pub fn get_dirty_bitmap(&self) -> Result<DirtyBitmap, VmError> {
+        if let Some(dirty_ring) = self.common.dirty_ring.as_ref() {
+            // Drain the rings once: this returns every vCPU-dirtied page since the last
+            // call (keyed by memslot id) and re-protects them in bulk.
+            let mut harvested = dirty_ring.collect();
+            let page_size = host_page_size();
+
+            return self
+                .guest_memory()
+                .iter()
+                .flat_map(|region| region.plugged_slots())
+                .map(|mem_slot| {
+                    let bitmap = match mem_slot.slice.bitmap() {
+                        Some(_) => {
+                            // Bits per `Vec<u64>` for this slot; must match `dump_dirty`.
+                            let expected_len = (mem_slot.slice.len() / page_size).div_ceil(64);
+                            let mut bitmap = harvested.remove(&mem_slot.slot).unwrap_or_default();
+                            // Ring offsets are page indices within the slot, so never
+                            // exceed `expected_len` words; pad up to the exact length.
+                            bitmap.resize(expected_len, 0);
+
+                            if dirty_ring.with_bitmap {
+                                // Supplement with pages dirtied outside vCPU context,
+                                // which the ring does not capture. On x86 Firecracker
+                                // (no nested) this set is normally empty. If the kernel
+                                // rejects the call, warn and skip rather than aborting an
+                                // otherwise-correct export round.
+                                match self.fd().get_dirty_log(mem_slot.slot, mem_slot.slice.len())
+                                {
+                                    Ok(supplementary) => {
+                                        for (word, supp) in supplementary.iter().enumerate() {
+                                            if let Some(dst) = bitmap.get_mut(word) {
+                                                *dst |= supp;
+                                            }
+                                        }
+                                    }
+                                    Err(err) => warn!(
+                                        "dirty-ring WITH_BITMAP supplementary get_dirty_log \
+                                         failed on slot {}: {err}",
+                                        mem_slot.slot
+                                    ),
+                                }
+                            }
+                            bitmap
+                        }
+                        None => mincore_bitmap(
+                            mem_slot.slice.ptr_guard_mut().as_ptr(),
+                            mem_slot.slice.len(),
+                        )?,
+                    };
+                    Ok((mem_slot.slot, bitmap))
+                })
+                .collect();
+        }
+
         self.guest_memory()
             .iter()
             .flat_map(|region| region.plugged_slots())

@@ -167,6 +167,49 @@ fn test_dirty_bitmap_success() {
     }
 }
 
+/// Incremental dirty-tracking correctness: each harvest must re-protect the pages it
+/// returns so they are NOT reported again unless re-dirtied. This is the property that
+/// makes per-round precopy correct and is exactly what the dirty ring's
+/// `KVM_RESET_DIRTY_RINGS` (or the bitmap path's re-protect) provides. A mechanism that
+/// failed to clear would keep re-reporting the same pages forever.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn test_dirty_bitmap_incremental_reset() {
+    let count_dirty = |vmm: &Arc<Mutex<Vmm>>| -> u32 {
+        vmm.lock()
+            .unwrap()
+            .vm
+            .as_kvm()
+            .unwrap()
+            .get_dirty_bitmap()
+            .unwrap()
+            .values()
+            .flat_map(|region| region.iter().map(|n| n.count_ones()))
+            .sum()
+    };
+
+    let (vmm, _evmgr) = vmm::test_utils::dirty_tracking_vmm(Some(NOISY_KERNEL_IMAGE));
+
+    // Let the noisy guest churn, then harvest a first round (drains + re-protects).
+    thread::sleep(Duration::from_millis(100));
+    let round1 = count_dirty(&vmm);
+    assert!(round1 > 0, "a churning guest must dirty pages");
+
+    // Pause so the guest stops writing, then drain everything dirtied up to the pause.
+    vmm.lock().unwrap().pause_vm().unwrap();
+    let _ = count_dirty(&vmm);
+
+    // Fully paused and drained: a further harvest must report nothing. If re-protect did
+    // not happen, the previously-dirtied pages would resurface here.
+    let round_final = count_dirty(&vmm);
+    assert_eq!(
+        round_final, 0,
+        "after harvest + re-protect, a paused guest must report zero dirty pages"
+    );
+
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
+}
+
 #[test]
 fn test_disallow_snapshots_without_pausing() {
     let (vmm, _) = default_vmm(Some(NOISY_KERNEL_IMAGE));

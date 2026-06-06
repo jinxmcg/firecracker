@@ -3,6 +3,8 @@
 
 /// Module with the implementation of a Bus that can hold devices.
 pub mod bus;
+/// Per-vCPU KVM dirty-ring support for low-stall live dirty-page export.
+pub mod dirty_ring;
 /// VM interrupts implementation.
 pub mod interrupts;
 /// Module with Kvm implementation.

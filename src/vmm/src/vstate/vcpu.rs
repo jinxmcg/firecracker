@@ -11,7 +11,7 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Barrier};
 use std::{fmt, io, thread};
 
-use kvm_bindings::{KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
+use kvm_bindings::{KVM_EXIT_DIRTY_RING_FULL, KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
 use kvm_ioctls::{VcpuExit, VcpuFd};
 use libc::{c_int, c_void, siginfo_t};
 use vmm_sys_util::errno;
@@ -27,6 +27,7 @@ use crate::seccomp::{BpfProgram, BpfProgramRef};
 use crate::utils::signal::{Killable, register_signal_handler, sigrtmin};
 use crate::utils::sm::StateMachine;
 use crate::vstate::bus::Bus;
+use crate::vstate::dirty_ring::DirtyRingState;
 use crate::vstate::vm::KvmVm;
 
 /// Signal number (SIGRTMIN) used to kick Vcpus.
@@ -102,6 +103,9 @@ pub struct Vcpu {
     response_receiver: Option<Receiver<VcpuResponse>>,
     /// The transmitting end of the responses channel owned by the vcpu side.
     response_sender: Sender<VcpuResponse>,
+    /// Shared dirty-ring state, present when the host supports the dirty ring. Used to
+    /// harvest + re-protect on `KVM_EXIT_DIRTY_RING_FULL` so the vCPU can make progress.
+    dirty_ring: Option<Arc<DirtyRingState>>,
 }
 
 impl Vcpu {
@@ -138,12 +142,19 @@ impl Vcpu {
             #[cfg(feature = "gdb")]
             gdb_event: None,
             kvm_vcpu,
+            dirty_ring: None,
         })
     }
 
     /// Sets a MMIO bus for this vcpu.
     pub fn set_mmio_bus(&mut self, mmio_bus: Arc<Bus>) {
         self.kvm_vcpu.peripherals.mmio_bus = Some(mmio_bus);
+    }
+
+    /// Gives this vCPU a handle to the shared dirty-ring state so it can harvest the
+    /// rings on `KVM_EXIT_DIRTY_RING_FULL`.
+    pub fn set_dirty_ring(&mut self, dirty_ring: Arc<DirtyRingState>) {
+        self.dirty_ring = Some(dirty_ring);
     }
 
     /// Attaches the fields required for debugging
@@ -405,6 +416,19 @@ impl Vcpu {
                 }
 
                 Ok(VcpuEmulation::Paused)
+            }
+            // The per-vCPU dirty ring is full. Harvest + re-protect all rings so the vCPU
+            // can keep dirtying, then resume. No page is lost: `harvest` records every
+            // GFN into the shared accumulator (consumed by the next export) *before*
+            // re-protecting. kvm-ioctls 0.24 surfaces this exit as `Unsupported(31)`.
+            Ok(VcpuExit::Unsupported(KVM_EXIT_DIRTY_RING_FULL)) => {
+                if let Some(dirty_ring) = self.dirty_ring.as_ref() {
+                    dirty_ring.harvest();
+                } else {
+                    // Should be unreachable: the exit only happens when a ring is active.
+                    warn!("Got KVM_EXIT_DIRTY_RING_FULL but no dirty ring is configured");
+                }
+                Ok(VcpuEmulation::Handled)
             }
             emulation_result => handle_kvm_exit(&mut self.kvm_vcpu.peripherals, emulation_result),
         }
