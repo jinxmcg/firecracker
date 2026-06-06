@@ -25,9 +25,10 @@ pub enum SnapshotType {
 /// 1) A file that contains the guest memory to be loaded,
 /// 2) An UDS where a custom page-fault handler process is listening for the UFFD set up by
 ///    Firecracker to handle its guest memory page faults.
-#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default, PartialEq, Eq, Deserialize)]
 pub enum MemBackendType {
     /// Guest memory contents will be loaded from a file.
+    #[default]
     File,
     /// Guest memory will be served through UFFD by a separate process.
     Uffd,
@@ -161,7 +162,7 @@ pub struct LoadSnapshotConfig {
 }
 
 /// Stores the configuration used for managing snapshot memory.
-#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemBackendConfig {
     /// Path to the backend used to handle the guest memory.
@@ -173,8 +174,25 @@ pub struct MemBackendConfig {
     pub base_mem_path: Option<PathBuf>,
     /// [Hybrid only] File of dirty guest page offsets (one u64 per line) to
     /// register with UFFD_MINOR; everything else is served from the seeded base.
+    /// In the fused Hybrid path this is the RESIDUAL set (pages re-dirtied around
+    /// cutover) — the only pages served lazily; the rest are eager-applied below.
     #[serde(default)]
     pub dirty_pages_path: Option<PathBuf>,
+    /// [Hybrid only] Delta file whose pages are eager-applied (COW'd private) into
+    /// guest memory BEFORE resume — the rounds-shipped, already-local pages. Used
+    /// with `eager_pages_path`. No UFFD on these.
+    #[serde(default)]
+    pub eager_delta_path: Option<PathBuf>,
+    /// [Hybrid only] Offsets (one u64 per line) to eager-apply from
+    /// `eager_delta_path` = the trusted set (dirty − residual). Disjoint from
+    /// `dirty_pages_path`.
+    #[serde(default)]
+    pub eager_pages_path: Option<PathBuf>,
+    /// [Hybrid only] Working-set manifest (one u64 per line) of base pages to
+    /// prefault (make resident) before resume, for faster first-touch. Pages also
+    /// in `dirty_pages_path` (residual/UFFD) are skipped so they still fault.
+    #[serde(default)]
+    pub prefill_pages_path: Option<PathBuf>,
 }
 
 /// The microVM state options.

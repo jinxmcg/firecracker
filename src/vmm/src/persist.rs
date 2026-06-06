@@ -10,6 +10,7 @@ use std::mem::forget;
 use std::os::fd::FromRawFd;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -752,15 +753,38 @@ fn guest_memory_from_hybrid(
         offset += region.size() as u64;
     }
 
-    // 2. (no per-VM seeding — the shared tmpfs base is already populated; clean pages
-    //    are served straight from its page cache, shared COW across all VMs.)
+    let page_size = huge_pages.page_size();
 
-    // 3. UFFD with MINOR_SHMEM negotiated.
+    // Residual = the pages served lazily over UFFD_MINOR. Load it first so the
+    // eager-apply / prefill steps stay DISJOINT from it: an eager-applied or
+    // prefaulted residual page would have its PTE present and never fault, so the
+    // handler could never supply its fresh content (the guest would read stale base).
+    let residual: HashSet<u64> = match mem_backend.dirty_pages_path.as_ref() {
+        Some(p) => read_page_offsets(p, page_size as u64)?.into_iter().collect(),
+        None => HashSet::new(),
+    };
+
+    // 2. Working-set prefill: make the hot BASE pages resident before resume so the
+    //    guest's first touches don't lazy-fault. Residual (UFFD) pages are skipped.
+    if let Some(manifest) = mem_backend.prefill_pages_path.as_ref() {
+        let n = prefault_pages(&guest_memory, manifest, &residual, page_size)?;
+        info!("hybrid: prefaulted {n} working-set pages");
+    }
+
+    // 3. Eager-apply the trusted delta (rounds-shipped, already local) into private
+    //    memory before resume — these need no UFFD. Disjoint from residual by caller.
+    if let (Some(delta), Some(pages)) = (
+        mem_backend.eager_delta_path.as_ref(),
+        mem_backend.eager_pages_path.as_ref(),
+    ) {
+        let n = apply_delta(&guest_memory, delta, pages)?;
+        info!("hybrid: eager-applied {n} trusted delta pages");
+    }
+
+    // 4. UFFD_MINOR over ONLY the residual; everything else is base or eager-applied.
     let uffd = create_minor_uffd()?;
-
-    // 4. register UFFD_MINOR over only the dirty pages (everything else is base).
     if let Some(dirty_path) = mem_backend.dirty_pages_path.as_ref() {
-        register_minor_ranges(&uffd, &backend_mappings, dirty_path, huge_pages.page_size())?;
+        register_minor_ranges(&uffd, &backend_mappings, dirty_path, page_size)?;
     }
 
     // 5. handshake: mappings + [uffd fd, shared-base fd] to the handler. The base fd
@@ -856,7 +880,9 @@ fn create_minor_uffd() -> Result<Uffd, GuestMemoryFromHybridError> {
         features: UFFD_FEATURE_MINOR_SHMEM | UFFD_FEATURE_EVENT_REMOVE,
         ioctls: 0,
     };
-    let ret = unsafe { libc::ioctl(raw, UFFDIO_API, &mut api as *mut UffdioApi) };
+    // `UFFDIO_API` is u64; ioctl's request arg is c_int on musl and c_ulong on glibc,
+    // so cast to the platform's type to build under both libc targets.
+    let ret = unsafe { libc::ioctl(raw, UFFDIO_API as _, &mut api as *mut UffdioApi) };
     if ret != 0 {
         let err = io::Error::last_os_error();
         unsafe { libc::close(raw) };
@@ -908,6 +934,54 @@ fn register_minor_ranges(
     Ok(registered)
 }
 
+/// Read a page-offset file (one u64 per line), page-align, sort + dedup.
+fn read_page_offsets(path: &Path, ps: u64) -> Result<Vec<u64>, GuestMemoryFromHybridError> {
+    let file = File::open(path)?;
+    let mut offsets: Vec<u64> = io::BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|l| l.trim().parse::<u64>().ok())
+        .map(|o| o & !(ps - 1))
+        .collect();
+    offsets.sort_unstable();
+    offsets.dedup();
+    Ok(offsets)
+}
+
+/// Prefault (make resident) the working-set pages in `manifest` by reading one byte
+/// of each from the MAP_PRIVATE base — a read brings in the shared page-cache page
+/// (no COW), so the guest's first touch doesn't lazy-fault. Pages in `skip` (the
+/// residual/UFFD set) are left untouched so they still minor-fault.
+fn prefault_pages(
+    guest_memory: &[GuestRegionMmap],
+    manifest: &Path,
+    skip: &HashSet<u64>,
+    page_size: usize,
+) -> Result<u64, GuestMemoryFromHybridError> {
+    let ps = page_size as u64;
+    // cumulative (file_offset, host_addr, size) per region
+    let mut cum = Vec::with_capacity(guest_memory.len());
+    let mut off = 0u64;
+    for r in guest_memory {
+        cum.push((off, r.as_ptr() as u64, r.size() as u64));
+        off += r.size() as u64;
+    }
+    let mut n = 0u64;
+    for o in read_page_offsets(manifest, ps)? {
+        if skip.contains(&o) {
+            continue;
+        }
+        if let Some(&(c, host, _)) = cum.iter().find(|&&(c, _, size)| o >= c && o < c + size) {
+            let addr = (host + (o - c)) as *const u8;
+            // SAFETY: addr is within this region's MAP_PRIVATE mapping; a volatile read
+            // faults the page in read-only (shared base page cache, no COW).
+            unsafe { std::ptr::read_volatile(addr) };
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::net::UnixListener;
@@ -932,6 +1006,38 @@ mod tests {
     use crate::vmm_config::net::NetworkInterfaceConfig;
     use crate::vmm_config::vsock::tests::default_config;
     use crate::vstate::memory::{GuestMemoryRegionState, GuestRegionType};
+
+    #[test]
+    fn test_read_page_offsets_aligns_sorts_dedups() {
+        // The page-offset parser backs both the residual (UFFD) set and the
+        // prefill/eager sets, so alignment + sort + dedup must be exact.
+        let tf = TempFile::new().unwrap();
+        // unsorted, with a non-aligned offset (4097 -> 4096) and a duplicate (8192)
+        std::fs::write(tf.as_path(), "8192\n4097\n4096\n8192\n0\nnot_a_number\n").unwrap();
+        let got = read_page_offsets(tf.as_path(), 4096).unwrap();
+        assert_eq!(got, vec![0, 4096, 8192]);
+    }
+
+    #[test]
+    fn test_mem_backend_config_parses_fusion_fields() {
+        // The fused Hybrid body adds eager_delta/eager_pages/prefill paths; absent
+        // ones must default to None (so the plain Hybrid/File paths are unaffected).
+        let json = r#"{"backend_path":"/tmp/u.sock","backend_type":"Hybrid",
+            "base_mem_path":"/dev/shm/neko.mem","dirty_pages_path":"/x/residual.set",
+            "eager_delta_path":"/x/buf","eager_pages_path":"/x/trusted.set",
+            "prefill_pages_path":"/x/warmset"}"#;
+        let cfg: crate::vmm_config::snapshot::MemBackendConfig =
+            serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.eager_delta_path.unwrap().to_str().unwrap(), "/x/buf");
+        assert_eq!(cfg.eager_pages_path.unwrap().to_str().unwrap(), "/x/trusted.set");
+        assert_eq!(cfg.prefill_pages_path.unwrap().to_str().unwrap(), "/x/warmset");
+
+        let minimal = r#"{"backend_path":"/m","backend_type":"File"}"#;
+        let cfg2: crate::vmm_config::snapshot::MemBackendConfig =
+            serde_json::from_str(minimal).unwrap();
+        assert!(cfg2.eager_delta_path.is_none());
+        assert!(cfg2.prefill_pages_path.is_none());
+    }
 
     fn default_vmm_with_devices() -> Vmm {
         let mut event_manager = EventManager::new().expect("Cannot create EventManager");

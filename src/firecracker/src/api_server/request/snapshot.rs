@@ -116,6 +116,9 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
                 backend_type: MemBackendType::File,
                 base_mem_path: None,
                 dirty_pages_path: None,
+                eager_delta_path: None,
+                eager_pages_path: None,
+                prefill_pages_path: None,
             }
         }
     };
@@ -217,6 +220,7 @@ mod tests {
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::File,
+                ..Default::default()
             },
             track_dirty_pages: false,
             resume_vm: false,
@@ -249,6 +253,7 @@ mod tests {
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::File,
+                ..Default::default()
             },
             track_dirty_pages: true,
             resume_vm: false,
@@ -281,6 +286,7 @@ mod tests {
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::Uffd,
+                ..Default::default()
             },
             track_dirty_pages: false,
             resume_vm: true,
@@ -319,6 +325,7 @@ mod tests {
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::Uffd,
+                ..Default::default()
             },
             track_dirty_pages: false,
             resume_vm: true,
@@ -351,6 +358,7 @@ mod tests {
             mem_backend: MemBackendConfig {
                 backend_path: PathBuf::from("bar"),
                 backend_type: MemBackendType::File,
+                ..Default::default()
             },
             track_dirty_pages: false,
             resume_vm: true,
