@@ -755,23 +755,38 @@ fn guest_memory_from_hybrid(
 
     let page_size = huge_pages.page_size();
 
-    // Residual = the pages served lazily over UFFD_MINOR. Load it first so the
-    // eager-apply / prefill steps stay DISJOINT from it: an eager-applied or
-    // prefaulted residual page would have its PTE present and never fault, so the
-    // handler could never supply its fresh content (the guest would read stale base).
+    // Residual = the pages served lazily over UFFD. Load it first so the eager-apply /
+    // prefill steps stay DISJOINT from it: an eager-applied or prefaulted residual page
+    // would have its PTE present and never fault, so the handler could never supply its
+    // fresh content (the guest would read stale base).
     let residual: HashSet<u64> = match mem_backend.dirty_pages_path.as_ref() {
         Some(p) => read_page_offsets(p, page_size as u64)?.into_iter().collect(),
         None => HashSet::new(),
     };
 
-    // 2. Working-set prefill: make the hot BASE pages resident before resume so the
-    //    guest's first touches don't lazy-fault. Residual (UFFD) pages are skipped.
+    // 2. ISOLATE the residual into PER-VM ANONYMOUS PRIVATE pages, then serve them with
+    //    UFFD MISSING + UFFDIO_COPY. The base shmem is mapped MAP_PRIVATE and shared
+    //    node-wide; the old scheme served residual with MINOR/CONTINUE, which writes the
+    //    SHARED base pagecache — polluting every other VM mapping that base (and the next
+    //    migration's prefill, which reads the base). Overlaying the residual ranges with
+    //    MAP_FIXED|MAP_ANONYMOUS|MAP_PRIVATE makes them per-VM from the first byte, so
+    //    the handler's COPY lands in this VM's own page and the shared base stays
+    //    PRISTINE — required to run hundreds of isolated VMs off one base. Clean pages
+    //    are untouched (still kernel-served, shared, COW). Must precede prefill/eager so
+    //    those steps see the final backing.
+    if let Some(dirty_path) = mem_backend.dirty_pages_path.as_ref() {
+        let n = overlay_anon_ranges(&backend_mappings, dirty_path, page_size)?;
+        info!("hybrid: isolated {n} residual pages into per-VM anonymous memory");
+    }
+
+    // 3. Working-set prefill: make the hot BASE pages resident before resume so the
+    //    guest's first touches don't lazy-fault. Residual pages are skipped (now anon).
     if let Some(manifest) = mem_backend.prefill_pages_path.as_ref() {
         let n = prefault_pages(&guest_memory, manifest, &residual, page_size)?;
         info!("hybrid: prefaulted {n} working-set pages");
     }
 
-    // 3. Eager-apply the trusted delta (rounds-shipped, already local) into private
+    // 4. Eager-apply the trusted delta (rounds-shipped, already local) into private
     //    memory before resume — these need no UFFD. Disjoint from residual by caller.
     if let (Some(delta), Some(pages)) = (
         mem_backend.eager_delta_path.as_ref(),
@@ -781,14 +796,15 @@ fn guest_memory_from_hybrid(
         info!("hybrid: eager-applied {n} trusted delta pages");
     }
 
-    // 4. UFFD_MINOR over ONLY the residual; everything else is base or eager-applied.
-    let uffd = create_minor_uffd()?;
+    // 5. UFFD MISSING over ONLY the residual (now anonymous); everything else is base or
+    //    eager-applied. The handler resolves these with UFFDIO_COPY into the per-VM page.
+    let uffd = create_missing_uffd()?;
     if let Some(dirty_path) = mem_backend.dirty_pages_path.as_ref() {
-        register_minor_ranges(&uffd, &backend_mappings, dirty_path, page_size)?;
+        register_minor_ranges(&uffd, &backend_mappings, dirty_path, page_size, RegisterMode::MISSING)?;
     }
 
-    // 5. handshake: mappings + [uffd fd, shared-base fd] to the handler. The base fd
-    //    is sent for protocol compat; the COPY-based handler no longer writes into it.
+    // 6. handshake: mappings + [uffd fd, shared-base fd] to the handler. The base fd
+    //    is sent for protocol compat; the COPY-based handler does not write into it.
     let socket = UnixStream::connect(&mem_backend.backend_path)?;
     let json = serde_json::to_string(&backend_mappings).unwrap();
     socket
@@ -868,6 +884,10 @@ fn apply_delta(
     Ok(applied)
 }
 
+// Retained for the MINOR/CONTINUE back-compat path (e.g. MISSING-unsupported backings);
+// the neko Hybrid path now isolates residual into anonymous memory + MISSING, so this is
+// not currently wired.
+#[allow(dead_code)]
 fn create_minor_uffd() -> Result<Uffd, GuestMemoryFromHybridError> {
     // SAFETY: simple syscall wrappers; the fd is owned by the returned Uffd.
     let raw = unsafe { libc::syscall(libc::SYS_userfaultfd, libc::O_CLOEXEC | libc::O_NONBLOCK) };
@@ -891,11 +911,36 @@ fn create_minor_uffd() -> Result<Uffd, GuestMemoryFromHybridError> {
     Ok(unsafe { Uffd::from_raw_fd(raw) })
 }
 
+/// UFFD for MISSING-mode faults over the (now anonymous) residual pages — resolved by
+/// the handler with UFFDIO_COPY into the VM's own private page. No MINOR_SHMEM feature:
+/// MISSING is the default fault mode and needs no shmem-specific capability.
+fn create_missing_uffd() -> Result<Uffd, GuestMemoryFromHybridError> {
+    // SAFETY: simple syscall wrappers; the fd is owned by the returned Uffd.
+    let raw = unsafe { libc::syscall(libc::SYS_userfaultfd, libc::O_CLOEXEC | libc::O_NONBLOCK) };
+    if raw < 0 {
+        return Err(GuestMemoryFromHybridError::Uffd(io::Error::last_os_error()));
+    }
+    let raw = raw as RawFd;
+    let mut api = UffdioApi {
+        api: UFFD_API,
+        features: UFFD_FEATURE_EVENT_REMOVE,
+        ioctls: 0,
+    };
+    let ret = unsafe { libc::ioctl(raw, UFFDIO_API as _, &mut api as *mut UffdioApi) };
+    if ret != 0 {
+        let err = io::Error::last_os_error();
+        unsafe { libc::close(raw) };
+        return Err(GuestMemoryFromHybridError::Uffd(err));
+    }
+    Ok(unsafe { Uffd::from_raw_fd(raw) })
+}
+
 fn register_minor_ranges(
     uffd: &Uffd,
     mappings: &[GuestRegionUffdMapping],
     dirty_path: &Path,
     page_size: usize,
+    mode: RegisterMode,
 ) -> Result<u64, GuestMemoryFromHybridError> {
     let ps = page_size as u64;
     let file = File::open(dirty_path)?;
@@ -925,13 +970,73 @@ fn register_minor_ranges(
         {
             let end = end.min(m.offset + m.size as u64); // clamp to this region
             let addr = (m.base_host_virt_addr + (start - m.offset)) as *mut libc::c_void;
-            uffd.register_with_mode(addr, (end - start) as usize, RegisterMode::MINOR)
+            uffd.register_with_mode(addr, (end - start) as usize, mode)
                 .map_err(GuestMemoryFromHybridError::Register)?;
             registered += (end - start) / ps;
         }
         i = j;
     }
     Ok(registered)
+}
+
+/// Replace the residual page ranges (from `dirty_path`) with MAP_FIXED anonymous
+/// PRIVATE memory, so each VM's residual is its own per-VM page from the first byte.
+/// This is what lets the handler resolve them with UFFDIO_COPY (writing the VM's own
+/// page) instead of MINOR/CONTINUE (writing the SHARED base pagecache, which would
+/// pollute every other VM on the node and the next migration's prefill). Clean pages
+/// stay backed by the shared base. Coalesces consecutive pages to minimize mmap calls.
+fn overlay_anon_ranges(
+    mappings: &[GuestRegionUffdMapping],
+    dirty_path: &Path,
+    page_size: usize,
+) -> Result<u64, GuestMemoryFromHybridError> {
+    let ps = page_size as u64;
+    let mut offsets: Vec<u64> = io::BufReader::new(File::open(dirty_path)?)
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|l| l.trim().parse::<u64>().ok())
+        .map(|o| o & !(ps - 1))
+        .collect();
+    offsets.sort_unstable();
+    offsets.dedup();
+
+    let mut overlaid = 0u64;
+    let mut i = 0;
+    while i < offsets.len() {
+        let start = offsets[i];
+        let mut end = start + ps;
+        let mut j = i + 1;
+        while j < offsets.len() && offsets[j] == end {
+            end += ps;
+            j += 1;
+        }
+        if let Some(m) = mappings
+            .iter()
+            .find(|m| start >= m.offset && start < m.offset + m.size as u64)
+        {
+            let end = end.min(m.offset + m.size as u64); // clamp to this region
+            let addr = (m.base_host_virt_addr + (start - m.offset)) as *mut libc::c_void;
+            // SAFETY: addr..end lies within this region's existing guest-memory mapping;
+            // MAP_FIXED atomically replaces that sub-range with fresh anonymous private
+            // pages at the same address. The guest VA layout is unchanged.
+            let p = unsafe {
+                libc::mmap(
+                    addr,
+                    (end - start) as usize,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_FIXED | libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                    -1,
+                    0,
+                )
+            };
+            if p == libc::MAP_FAILED {
+                return Err(GuestMemoryFromHybridError::Io(io::Error::last_os_error()));
+            }
+            overlaid += (end - start) / ps;
+        }
+        i = j;
+    }
+    Ok(overlaid)
 }
 
 /// Read a page-offset file (one u64 per line), page-align, sort + dedup.
