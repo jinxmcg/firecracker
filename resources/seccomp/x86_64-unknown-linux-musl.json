@@ -742,6 +742,10 @@
                         "comment": "Ensure PROT_EXEC is not set"
                     }
                 ]
+            },
+            {
+                "syscall": "sched_getaffinity",
+                "comment": "std::thread::available_parallelism in the parallel eager-delta apply (snapshot load)"
             }
         ]
     },

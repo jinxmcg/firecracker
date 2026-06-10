@@ -847,6 +847,9 @@ fn apply_delta(
     dirty_path: &Path,
 ) -> Result<u64, GuestMemoryFromHybridError> {
     const PS: usize = 4096;
+    /// Cap per coalesced run (and per-thread scratch buffer). Large enough that the
+    /// pread syscall cost amortizes away, small enough to keep scratch cheap.
+    const MAX_RUN: usize = 4 << 20;
     let delta = File::open(delta_path)?;
     let dfd = delta.as_raw_fd();
     // cumulative (file_offset, host_addr, size) per region
@@ -864,24 +867,85 @@ fn apply_delta(
         .collect();
     offsets.sort_unstable();
     offsets.dedup();
-    let mut buf = vec![0u8; PS];
-    let mut applied = 0u64;
+
+    // The old shape did one 4 KiB pread + memcpy PER PAGE, single-threaded — ~165k
+    // syscalls and ~850ms for a busy-Chrome eager set, all inside the resume
+    // blackout. Deltas are run-heavy, so: (1) coalesce the sorted offsets into
+    // contiguous runs within a region, then (2) apply the runs on a few scoped
+    // threads. Destinations are disjoint pages and pread is positioned, so the
+    // workers share nothing but the fd.
+    struct Run {
+        file_off: u64,
+        host: u64,
+        len: usize,
+    }
+    let mut runs: Vec<Run> = Vec::new();
     for o in offsets {
         let Some(&(c, host, _)) = cum.iter().find(|&&(c, _, size)| o >= c && o < c + size)
         else {
             continue;
         };
-        // read the fresh page from the delta file at its guest-memory offset
-        let n = unsafe { libc::pread(dfd, buf.as_mut_ptr().cast(), PS, o as i64) };
-        if n != PS as isize {
-            continue; // hole / short read: nothing to overlay
+        let host_addr = host + (o - c);
+        if let Some(last) = runs.last_mut() {
+            // extend only when BOTH file and host are contiguous: adjacent regions
+            // are contiguous in file space but not in host space (a run crossing a
+            // region boundary would write past the first region's mapping).
+            if last.file_off + last.len as u64 == o
+                && last.host + last.len as u64 == host_addr
+                && last.len + PS <= MAX_RUN
+            {
+                last.len += PS;
+                continue;
+            }
         }
-        let dst = (host + (o - c)) as *mut u8;
-        // SAFETY: dst is within this region's MAP_PRIVATE mapping; the write COWs the page.
-        unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), dst, PS) };
-        applied += 1;
+        runs.push(Run {
+            file_off: o,
+            host: host_addr,
+            len: PS,
+        });
     }
-    Ok(applied)
+
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(8)
+        .min(runs.len().max(1));
+    let applied = std::sync::atomic::AtomicU64::new(0);
+    let apply_chunk = |chunk: &[Run]| {
+        let mut buf = vec![0u8; MAX_RUN];
+        for run in chunk {
+            // read the fresh pages from the delta file at their guest-memory offsets
+            let n = unsafe {
+                libc::pread(dfd, buf.as_mut_ptr().cast(), run.len, run.file_off as i64)
+            };
+            if n <= 0 {
+                continue; // beyond EOF / error: nothing to overlay
+            }
+            // apply only the complete pages read (a short read near EOF mirrors the
+            // old per-page `n != PS -> skip` behaviour for the truncated tail)
+            let full = (n as usize / PS) * PS;
+            if full == 0 {
+                continue;
+            }
+            let dst = run.host as *mut u8;
+            // SAFETY: dst..dst+full is within this region's MAP_PRIVATE mapping
+            // (runs never cross regions); the writes COW the pages. No two runs
+            // overlap (offsets are sorted + deduped), so workers never alias.
+            unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), dst, full) };
+            applied.fetch_add((full / PS) as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    };
+    if workers <= 1 {
+        apply_chunk(&runs);
+    } else {
+        let chunk_size = runs.len().div_ceil(workers);
+        std::thread::scope(|s| {
+            for chunk in runs.chunks(chunk_size) {
+                s.spawn(|| apply_chunk(chunk));
+            }
+        });
+    }
+    Ok(applied.into_inner())
 }
 
 // Retained for the MINOR/CONTINUE back-compat path (e.g. MISSING-unsupported backings);
