@@ -194,19 +194,6 @@ pub struct DirtyRingState {
     /// also harvest the per-memslot bitmap for pages dirtied outside vCPU context.
     pub with_bitmap: bool,
     inner: Mutex<DirtyRingInner>,
-    /// Periodic-harvester control (see [`DirtyRingState::arm_harvester`]).
-    harvester: Mutex<HarvesterCtl>,
-}
-
-/// Control block for the periodic background harvester.
-#[derive(Debug)]
-struct HarvesterCtl {
-    /// A harvester thread is currently alive.
-    running: bool,
-    /// Drain/reset period.
-    period: std::time::Duration,
-    /// The thread parks itself for good once this passes (re-armed by each export).
-    deadline: std::time::Instant,
 }
 
 impl DirtyRingState {
@@ -235,68 +222,15 @@ impl DirtyRingState {
         std::mem::take(&mut inner.accum)
     }
 
-    /// Arm (or re-arm) the periodic background harvester: drain the rings +
-    /// `KVM_RESET_DIRTY_RINGS` every `period_ms`, so each reset re-protects only a
-    /// few-ms batch of GFNs — the per-round one-big-reset stall (mmu pass + remote
-    /// TLB shootdown + the write-fault storm that follows) becomes a smooth,
-    /// imperceptible tax. Harvested pages land in the same accumulator the export's
-    /// `collect()` consumes, so correctness is unchanged. The thread re-arms its TTL
-    /// on every call and parks for good ~30s after the last one (i.e. when the
-    /// migration's rounds stop calling) — dirty tracking outside migrations keeps
-    /// the cheap once-per-export behaviour.
-    pub fn arm_harvester(self: &std::sync::Arc<Self>, period_ms: u64) {
-        const TTL: std::time::Duration = std::time::Duration::from_secs(30);
-        let mut h = self.harvester.lock().expect("Poisoned lock");
-        h.period = std::time::Duration::from_millis(period_ms.clamp(20, 5000));
-        h.deadline = std::time::Instant::now() + TTL;
-        if h.running {
-            return;
-        }
-        h.running = true;
-        drop(h);
-        let me = std::sync::Arc::clone(self);
-        // Same thread-spawn syscall profile as the background dirty dump (clone
-        // CLONE_THREAD + mmap MAP_STACK + set_robust_list), and the RESET ioctl is
-        // already in the seccomp filter — no new syscalls.
-        std::thread::spawn(move || {
-            eprintln!("dirty-ring harvester: running");
-            loop {
-                let (period, expired) = {
-                    let h = me.harvester.lock().expect("Poisoned lock");
-                    (h.period, std::time::Instant::now() >= h.deadline)
-                };
-                if expired {
-                    me.harvester.lock().expect("Poisoned lock").running = false;
-                    eprintln!("dirty-ring harvester: idle TTL reached; stopped");
-                    return;
-                }
-                std::thread::sleep(period);
-                let mut inner = me.inner.lock().expect("Poisoned lock");
-                me.harvest_locked(&mut inner);
-            }
-        });
-    }
-
     fn harvest_locked(&self, inner: &mut DirtyRingInner) {
-        let t0 = std::time::Instant::now();
         let mut harvested = false;
         // Split the borrow so we can drain rings into accum simultaneously.
         let DirtyRingInner { rings, accum } = inner;
         for ring in rings.iter_mut() {
             harvested |= ring.harvest_into(accum);
         }
-        let harvest_us = t0.elapsed().as_micros();
         if harvested {
             self.reset_rings();
-            // KVM_RESET_DIRTY_RINGS re-protects every harvested GFN: mmu work + a
-            // remote TLB flush whose cost scales with the harvested batch. Timing it
-            // sizes the per-round guest stall (and the win of harvesting in small
-            // periodic doses instead of one per-round batch).
-            eprintln!(
-                "dirty-ring harvest: {}us + reset {}us",
-                harvest_us,
-                t0.elapsed().as_micros() - harvest_us
-            );
         }
     }
 
@@ -435,11 +369,6 @@ pub fn enable(vm_fd: &VmFd, kvm_fd: &KvmFd) -> Option<DirtyRingState> {
         inner: Mutex::new(DirtyRingInner {
             rings: Vec::new(),
             accum: HashMap::new(),
-        }),
-        harvester: Mutex::new(HarvesterCtl {
-            running: false,
-            period: std::time::Duration::from_millis(150),
-            deadline: std::time::Instant::now(),
         }),
     })
 }

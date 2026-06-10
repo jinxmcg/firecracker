@@ -505,23 +505,12 @@ impl Vmm {
         sync: bool,
         mark_virtio_queues: bool,
         background: bool,
-        harvest_ms: u64,
     ) -> Result<(), persist::CreateSnapshotError> {
         let kvm_vm = self.vm.as_kvm().ok_or_else(|| {
             persist::CreateSnapshotError::MicrovmState(persist::MicrovmStateError::NotAllowed(
                 "dirty memory export requires KVM".into(),
             ))
         })?;
-
-        // Live-migration rounds: keep the per-vCPU rings drained in small periodic
-        // doses (each KVM_RESET_DIRTY_RINGS then re-protects only a few-ms batch)
-        // instead of one big per-round reset — the remaining per-round guest stall.
-        // Re-armed by every round's export; self-stops ~30s after the last one.
-        if harvest_ms > 0 {
-            if let Some(ring) = kvm_vm.common.dirty_ring.as_ref() {
-                ring.arm_harvester(harvest_ms);
-            }
-        }
 
         if mark_virtio_queues {
             self.device_manager

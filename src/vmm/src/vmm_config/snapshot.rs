@@ -87,14 +87,6 @@ pub struct DirtyMemoryParams {
     /// loop — and so the guest's virtio I/O — running during a multi-GB dump.
     #[serde(default)]
     pub background: bool,
-    /// [dirty-ring only] Arm a periodic background harvester with this period (ms):
-    /// the rings are drained + `KVM_RESET_DIRTY_RINGS`-reset every `harvest_ms` into
-    /// the accumulator, so each reset re-protects only a few-ms batch of pages — a
-    /// smooth tax instead of the one big per-round re-protect + TLB-shootdown stall.
-    /// Re-armed by every export that carries it; self-stops ~30s after the last one
-    /// (i.e. when the migration's rounds end). 0/absent = per-round harvest as before.
-    #[serde(default)]
-    pub harvest_ms: u64,
 }
 
 fn default_dirty_memory_sync() -> bool {
