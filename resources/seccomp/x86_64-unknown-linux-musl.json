@@ -724,6 +724,14 @@
                 "comment": "Background dirty-memory export atomically publishes <path>.tmp -> <path> on completion"
             },
             {
+                "syscall": "nanosleep",
+                "comment": "Periodic dirty-ring harvester thread sleeps between drains (musl thread::sleep)"
+            },
+            {
+                "syscall": "clock_nanosleep",
+                "comment": "Periodic dirty-ring harvester thread sleeps between drains (glibc/alternate path)"
+            },
+            {
                 "syscall": "mmap",
                 "comment": "Rust std allocates a per-thread sigaltstack (MAP_STACK) when the background dirty-export dump thread starts",
                 "args": [

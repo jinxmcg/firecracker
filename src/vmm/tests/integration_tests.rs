@@ -234,7 +234,7 @@ fn test_background_dirty_export() {
             match vmm
                 .lock()
                 .unwrap()
-                .export_dirty_memory(path, false, true, true)
+                .export_dirty_memory(path, false, true, true, 0)
             {
                 Ok(()) => break,
                 Err(err) => {
