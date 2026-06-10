@@ -384,6 +384,29 @@ pub enum RestoreFromSnapshotGuestMemoryError {
     Precopy(GuestMemoryFromHybridError),
 }
 
+/// Phase-A entry for the two-phase Hybrid restore: parse the snapshot only for the
+/// memory layout + huge-page config, then map+overlay+register the cumulative dirty
+/// set and hold the result (see [`PreparedHybrid`]). The snapshot passed here may be
+/// the BASE snapshot — only its region geometry is used, and the resume phase
+/// sanity-checks that geometry against the final snapshot.
+pub fn prepare_hybrid_from_params(
+    params: &LoadSnapshotParams,
+) -> Result<PreparedHybrid, RestoreFromSnapshotError> {
+    if params.mem_backend.backend_type != MemBackendType::Hybrid {
+        return Err(RestoreFromSnapshotError::GuestMemory(
+            RestoreFromSnapshotGuestMemoryError::Hybrid(GuestMemoryFromHybridError::InvalidPhase),
+        ));
+    }
+    let microvm_state = snapshot_state_from_file(&params.snapshot_path)?;
+    prepare_hybrid(
+        &params.mem_backend,
+        &microvm_state.vm_state.memory,
+        params.track_dirty_pages,
+        microvm_state.vm_info.huge_pages,
+    )
+    .map_err(|e| RestoreFromSnapshotError::GuestMemory(RestoreFromSnapshotGuestMemoryError::Hybrid(e)))
+}
+
 /// Loads a Microvm snapshot producing a 'paused' Microvm.
 pub fn restore_from_snapshot(
     instance_info: &InstanceInfo,
@@ -391,6 +414,7 @@ pub fn restore_from_snapshot(
     seccomp_filters: &BpfThreadMap,
     params: &LoadSnapshotParams,
     vm_resources: &mut VmResources,
+    prepared: Option<PreparedHybrid>,
 ) -> Result<Arc<Mutex<Vmm>>, RestoreFromSnapshotError> {
     let mut microvm_state = snapshot_state_from_file(&params.snapshot_path)?;
     for entry in &params.network_overrides {
@@ -466,6 +490,7 @@ pub fn restore_from_snapshot(
     let mem_backend_path = &params.mem_backend.backend_path;
     let mem_state = &microvm_state.vm_state.memory;
 
+    let t_mem = std::time::Instant::now(); // guest-memory phase vs device/vCPU restore split
     let (guest_memory, uffd) = match params.mem_backend.backend_type {
         MemBackendType::File => {
             if vm_resources.machine_config.huge_pages.is_hugetlbfs() {
@@ -487,13 +512,19 @@ pub fn restore_from_snapshot(
             vm_resources.machine_config.huge_pages,
         )
         .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
-        MemBackendType::Hybrid => guest_memory_from_hybrid(
-            &params.mem_backend,
-            mem_state,
-            track_dirty_pages,
-            vm_resources.machine_config.huge_pages,
-        )
-        .map_err(RestoreFromSnapshotGuestMemoryError::Hybrid)?,
+        MemBackendType::Hybrid => match prepared {
+            // two-phase resume: overlay/register only the final delta on the memory
+            // the prepare phase already set up, then the deferred handler handshake
+            Some(p) => finish_prepared_hybrid(p, &params.mem_backend, mem_state)
+                .map_err(RestoreFromSnapshotGuestMemoryError::Hybrid)?,
+            None => guest_memory_from_hybrid(
+                &params.mem_backend,
+                mem_state,
+                track_dirty_pages,
+                vm_resources.machine_config.huge_pages,
+            )
+            .map_err(RestoreFromSnapshotGuestMemoryError::Hybrid)?,
+        },
         MemBackendType::Precopy => guest_memory_from_precopy(
             &params.mem_backend,
             mem_state,
@@ -501,7 +532,9 @@ pub fn restore_from_snapshot(
         )
         .map_err(RestoreFromSnapshotGuestMemoryError::Precopy)?,
     };
-    builder::build_microvm_from_snapshot(
+    let mem_us = t_mem.elapsed().as_micros();
+    let t_build = std::time::Instant::now();
+    let r = builder::build_microvm_from_snapshot(
         instance_info,
         event_manager,
         microvm_state,
@@ -511,7 +544,13 @@ pub fn restore_from_snapshot(
         vm_resources,
         params.clock_realtime,
     )
-    .map_err(RestoreFromSnapshotError::Build)
+    .map_err(RestoreFromSnapshotError::Build);
+    eprintln!(
+        "restore timing: guest-memory={}us build(devices+vcpus)={}us",
+        mem_us,
+        t_build.elapsed().as_micros()
+    );
+    r
 }
 
 /// Error type for [`snapshot_state_from_file`]
@@ -713,6 +752,142 @@ pub enum GuestMemoryFromHybridError {
     Register(userfaultfd::Error),
     /// Failed to send fds to handler: {0}
     Send(vmm_sys_util::errno::Error),
+    /// phase=resume without a prior phase=prepare (or eager/prefill fields in a two-phase request)
+    InvalidPhase,
+    /// prepared memory layout does not match this snapshot's regions
+    PreparedMismatch,
+}
+
+/// Guest memory prepared by the two-phase Hybrid restore's `prepare` phase: the shared
+/// base is mapped, the CUMULATIVE dirty set is anon-overlaid + UFFD-registered, and the
+/// uffd is held UNATTACHED (no handler handshake yet). Nothing can fault on it — no
+/// vCPUs run and no device state has been restored — so holding it across API calls is
+/// safe. The `resume` phase overlays/registers only the final-round delta, performs the
+/// handshake, and hands `guest_memory`+`uffd` to the normal microvm build.
+#[derive(Debug)]
+pub struct PreparedHybrid {
+    guest_memory: Vec<GuestRegionMmap>,
+    uffd: Uffd,
+    backend_mappings: Vec<GuestRegionUffdMapping>,
+    /// keeps the shared-base fd alive for the deferred handshake
+    base: File,
+    page_size: usize,
+    /// (offset, size) of each region — sanity-checked against the resume snapshot
+    region_shape: Vec<(u64, usize)>,
+}
+
+/// Phase A of the two-phase Hybrid restore: map the shared base, anon-overlay +
+/// UFFD-register the supplied (cumulative) dirty set, and hold the result. Runs while
+/// the migration source is still live — this is exactly the set-size-proportional work
+/// that used to sit inside the resume blackout. Eager/prefill fields are not supported
+/// in two-phase mode (an eager apply into registered pages would deadlock on the UFFD).
+pub fn prepare_hybrid(
+    mem_backend: &MemBackendConfig,
+    mem_state: &GuestMemoryState,
+    track_dirty_pages: bool,
+    huge_pages: HugePageConfig,
+) -> Result<PreparedHybrid, GuestMemoryFromHybridError> {
+    if mem_backend.eager_delta_path.is_some()
+        || mem_backend.eager_pages_path.is_some()
+        || mem_backend.prefill_pages_path.is_some()
+    {
+        return Err(GuestMemoryFromHybridError::InvalidPhase);
+    }
+    let base_path = mem_backend
+        .base_mem_path
+        .as_ref()
+        .ok_or(GuestMemoryFromHybridError::MissingBase)?;
+    let t0 = std::time::Instant::now();
+    let regions: Vec<_> = mem_state.regions().collect();
+    let region_shape: Vec<(u64, usize)> = regions.iter().map(|r| (r.0 .0, r.1)).collect();
+    let base = File::open(base_path)?;
+    let base_clone = base.try_clone()?;
+    let guest_memory = memory::snapshot_file(base, regions.iter().copied(), track_dirty_pages)?;
+
+    let page_size = huge_pages.page_size();
+    let mut backend_mappings = Vec::with_capacity(guest_memory.len());
+    let mut offset = 0u64;
+    for region in guest_memory.iter() {
+        #[allow(deprecated)]
+        backend_mappings.push(GuestRegionUffdMapping {
+            base_host_virt_addr: region.as_ptr() as u64,
+            size: region.size(),
+            offset,
+            page_size,
+            page_size_kib: page_size,
+        });
+        offset += region.size() as u64;
+    }
+
+    let mut n = 0u64;
+    if let Some(dirty_path) = mem_backend.dirty_pages_path.as_ref() {
+        n = overlay_anon_ranges(&backend_mappings, dirty_path, page_size)?;
+    }
+    let uffd = create_missing_uffd()?;
+    let mut reg = 0u64;
+    if let Some(dirty_path) = mem_backend.dirty_pages_path.as_ref() {
+        reg = register_minor_ranges(&uffd, &backend_mappings, dirty_path, page_size, RegisterMode::MISSING)?;
+    }
+    eprintln!(
+        "hybrid-prepare: overlaid {n} + registered {reg} cumulative pages in {}us (off the blackout)",
+        t0.elapsed().as_micros()
+    );
+    Ok(PreparedHybrid {
+        guest_memory,
+        uffd,
+        backend_mappings,
+        base: base_clone,
+        page_size,
+        region_shape,
+    })
+}
+
+/// Phase B: finish a prepared Hybrid restore at cutover. Overlays/registers ONLY this
+/// request's dirty set (the final-round delta), then performs the deferred handler
+/// handshake. The caller proceeds to the normal device/vCPU restore with the result.
+fn finish_prepared_hybrid(
+    prepared: PreparedHybrid,
+    mem_backend: &MemBackendConfig,
+    mem_state: &GuestMemoryState,
+) -> Result<(Vec<GuestRegionMmap>, Option<Uffd>), GuestMemoryFromHybridError> {
+    if mem_backend.eager_delta_path.is_some()
+        || mem_backend.eager_pages_path.is_some()
+        || mem_backend.prefill_pages_path.is_some()
+    {
+        return Err(GuestMemoryFromHybridError::InvalidPhase);
+    }
+    // The final snapshot must describe the same memory layout the prepare mapped.
+    let shape: Vec<(u64, usize)> = mem_state.regions().map(|r| (r.0 .0, r.1)).collect();
+    if shape != prepared.region_shape {
+        return Err(GuestMemoryFromHybridError::PreparedMismatch);
+    }
+    let t0 = std::time::Instant::now();
+    let PreparedHybrid {
+        guest_memory,
+        uffd,
+        backend_mappings,
+        base,
+        page_size,
+        ..
+    } = prepared;
+    let (mut n, mut reg) = (0u64, 0u64);
+    if let Some(dirty_path) = mem_backend.dirty_pages_path.as_ref() {
+        n = overlay_anon_ranges(&backend_mappings, dirty_path, page_size)?;
+        reg = register_minor_ranges(&uffd, &backend_mappings, dirty_path, page_size, RegisterMode::MISSING)?;
+    }
+    // Deferred handshake: mappings + [uffd fd, shared-base fd] to the (now running)
+    // handler — identical wire format to the one-shot path.
+    let socket = UnixStream::connect(&mem_backend.backend_path)?;
+    let json = serde_json::to_string(&backend_mappings).unwrap();
+    socket
+        .send_with_fds(&[json.as_bytes()], &[uffd.as_raw_fd(), base.as_raw_fd()])
+        .map_err(GuestMemoryFromHybridError::Send)?;
+    forget(socket);
+    eprintln!(
+        "hybrid-resume(prepared): delta overlay {n} + register {reg} pages + handshake in {}us",
+        t0.elapsed().as_micros()
+    );
+    Ok((guest_memory, Some(uffd)))
 }
 
 /// Hybrid restore: back guest RAM with a memfd seeded from the base image
@@ -734,10 +909,12 @@ fn guest_memory_from_hybrid(
     //    shared physical pages (COW on write) — one base copy node-wide instead of a
     //    per-VM 4GB memfd. base_mem_path MUST be tmpfs/shmem so UFFD_MINOR can later
     //    register over the dirty tail. The file is seeded once per node externally.
+    let t0 = std::time::Instant::now(); // phase timing: printed at the end (stderr)
     let regions: Vec<_> = mem_state.regions().collect();
     let base = File::open(base_path)?;
     let base_fd = base.as_raw_fd();
     let guest_memory = memory::snapshot_file(base, regions.iter().copied(), track_dirty_pages)?;
+    let t_map = t0.elapsed().as_micros();
 
     let mut backend_mappings = Vec::with_capacity(guest_memory.len());
     let mut offset = 0u64;
@@ -774,10 +951,14 @@ fn guest_memory_from_hybrid(
     //    PRISTINE — required to run hundreds of isolated VMs off one base. Clean pages
     //    are untouched (still kernel-served, shared, COW). Must precede prefill/eager so
     //    those steps see the final backing.
+    let t_pre_overlay = t0.elapsed().as_micros();
+    let mut n_overlaid = 0u64;
     if let Some(dirty_path) = mem_backend.dirty_pages_path.as_ref() {
         let n = overlay_anon_ranges(&backend_mappings, dirty_path, page_size)?;
         info!("hybrid: isolated {n} residual pages into per-VM anonymous memory");
+        n_overlaid = n;
     }
+    let t_overlay = t0.elapsed().as_micros();
 
     // 3. Working-set prefill: make the hot BASE pages resident before resume so the
     //    guest's first touches don't lazy-fault. Residual pages are skipped (now anon).
@@ -798,10 +979,15 @@ fn guest_memory_from_hybrid(
 
     // 5. UFFD MISSING over ONLY the residual (now anonymous); everything else is base or
     //    eager-applied. The handler resolves these with UFFDIO_COPY into the per-VM page.
+    let t_pre_reg = t0.elapsed().as_micros();
     let uffd = create_missing_uffd()?;
+    let mut n_registered = 0u64;
     if let Some(dirty_path) = mem_backend.dirty_pages_path.as_ref() {
-        register_minor_ranges(&uffd, &backend_mappings, dirty_path, page_size, RegisterMode::MISSING)?;
+        n_registered = register_minor_ranges(
+            &uffd, &backend_mappings, dirty_path, page_size, RegisterMode::MISSING,
+        )?;
     }
+    let t_reg = t0.elapsed().as_micros();
 
     // 6. handshake: mappings + [uffd fd, shared-base fd] to the handler. The base fd
     //    is sent for protocol compat; the COPY-based handler does not write into it.
@@ -811,6 +997,20 @@ fn guest_memory_from_hybrid(
         .send_with_fds(&[json.as_bytes()], &[uffd.as_raw_fd(), base_fd])
         .map_err(GuestMemoryFromHybridError::Send)?;
     forget(socket);
+
+    // Phase breakdown to stderr (collected in the agent's children log): sizes the
+    // candidate win of moving overlay+register out of the resume blackout.
+    eprintln!(
+        "hybrid-load timing: map={}us overlay={}us({} pages) eager+prefill={}us register={}us({} pages) handshake={}us total={}us",
+        t_map,
+        t_overlay - t_pre_overlay,
+        n_overlaid,
+        t_pre_reg - t_overlay,
+        t_reg - t_pre_reg,
+        n_registered,
+        t0.elapsed().as_micros() - t_reg,
+        t0.elapsed().as_micros()
+    );
 
     Ok((guest_memory, Some(uffd)))
 }

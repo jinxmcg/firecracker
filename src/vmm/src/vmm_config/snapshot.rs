@@ -131,6 +131,23 @@ pub struct LoadSnapshotParams {
     /// advancing kvmclock by the wall-clock time elapsed since the snapshot was taken. When false
     /// (default), kvmclock resumes from where it was at snapshot time.
     pub clock_realtime: bool,
+    /// [Hybrid only] Two-phase restore. `Prepare` (callable while the migration source still
+    /// runs): map the shared base + anon-overlay + UFFD-register the supplied (cumulative)
+    /// dirty set, then HOLD the prepared memory + uffd — no handler handshake, no device
+    /// restore, no resume. `Resume` (at cutover): overlay/register only this request's
+    /// (small, final-round) dirty delta on the held memory, handshake with the handler,
+    /// restore devices/vCPUs and (optionally) resume. `None` = the one-shot load, unchanged.
+    pub phase: Option<LoadPhase>,
+}
+
+/// Phase discriminator for the two-phase Hybrid restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LoadPhase {
+    /// Map base + overlay/register cumulative dirty; hold memory + uffd.
+    Prepare,
+    /// Finish on prepared memory: register the delta, handshake, restore, resume.
+    Resume,
 }
 
 /// Stores the configuration for loading a snapshot that is provided by the user.
@@ -166,6 +183,9 @@ pub struct LoadSnapshotConfig {
     /// [x86_64 only] When set to true, passes `KVM_CLOCK_REALTIME` to `KVM_SET_CLOCK` on restore.
     #[serde(default)]
     pub clock_realtime: bool,
+    /// [Hybrid only] Two-phase restore discriminator ("prepare" | "resume"); absent = one-shot.
+    #[serde(default)]
+    pub phase: Option<LoadPhase>,
 }
 
 /// Stores the configuration used for managing snapshot memory.

@@ -294,6 +294,9 @@ pub struct PrebootApiController<'a> {
     event_manager: &'a mut EventManager,
     /// The [`Vmm`] object constructed through requests
     pub built_vmm: Option<Arc<Mutex<Vmm>>>,
+    /// Two-phase Hybrid restore: memory prepared by a `phase=prepare` snapshot load,
+    /// consumed by the matching `phase=resume` (see persist::PreparedHybrid).
+    prepared_hybrid: Option<super::persist::PreparedHybrid>,
     // Configuring boot specific resources will set this to true.
     // Loading from snapshot will not be allowed once this is true.
     boot_path: bool,
@@ -360,6 +363,7 @@ impl<'a> PrebootApiController<'a> {
             vm_resources,
             event_manager,
             built_vmm: None,
+            prepared_hybrid: None,
             boot_path: false,
             fatal_error: None,
         }
@@ -653,6 +657,7 @@ impl<'a> PrebootApiController<'a> {
         &mut self,
         load_params: &LoadSnapshotParams,
     ) -> Result<VmmData, LoadSnapshotError> {
+        use crate::vmm_config::snapshot::LoadPhase;
         let load_start_us = get_time_us(ClockType::Monotonic);
 
         if self.boot_path {
@@ -661,6 +666,40 @@ impl<'a> PrebootApiController<'a> {
             return Err(err);
         }
 
+        // Two-phase Hybrid restore. `prepare` does the set-size-proportional memory
+        // work (anon overlay + UFFD register over the cumulative dirty set) NOW —
+        // while the migration source still runs — and holds the result; the VM is
+        // NOT built, so further snapshot loads stay allowed. `resume` consumes it
+        // below; a prepare error is NOT fatal (the instance stays usable for a
+        // normal one-shot load).
+        let prepared = match load_params.phase {
+            Some(LoadPhase::Prepare) => {
+                self.prepared_hybrid = Some(super::persist::prepare_hybrid_from_params(load_params)?);
+                return Ok(VmmData::Empty);
+            }
+            Some(LoadPhase::Resume) => {
+                if self.prepared_hybrid.is_none() {
+                    // refusing is the only safe option: a one-shot load with the
+                    // request's DELTA-only dirty set would leave the cumulative
+                    // pages reading stale shared-base content
+                    return Err(LoadSnapshotError::RestoreFromSnapshot(
+                        super::persist::RestoreFromSnapshotError::GuestMemory(
+                            super::persist::RestoreFromSnapshotGuestMemoryError::Hybrid(
+                                super::persist::GuestMemoryFromHybridError::InvalidPhase,
+                            ),
+                        ),
+                    ));
+                }
+                self.prepared_hybrid.take()
+            }
+            // one-shot load: discard any stale prepared state (its mappings are
+            // about to be replaced wholesale by the fresh load)
+            None => {
+                self.prepared_hybrid = None;
+                None
+            }
+        };
+
         // Restore VM from snapshot
         let vmm = restore_from_snapshot(
             &self.instance_info,
@@ -668,6 +707,7 @@ impl<'a> PrebootApiController<'a> {
             self.seccomp_filters,
             load_params,
             self.vm_resources,
+            prepared,
         )
         .inspect_err(|_| {
             // If restore fails, we consider the process is too dirty to recover.
@@ -1388,6 +1428,7 @@ mod tests {
                 network_overrides: vec![],
                 vsock_override: None,
                 clock_realtime: false,
+                phase: None,
             },
         )));
         check_unsupported(runtime_request(VmmAction::SetEntropyDevice(
