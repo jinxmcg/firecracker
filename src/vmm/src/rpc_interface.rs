@@ -1006,6 +1006,7 @@ impl RuntimeApiController {
                 &dirty_memory_params.mem_file_path,
                 dirty_memory_params.sync,
                 dirty_memory_params.mark_virtio_queues,
+                dirty_memory_params.background,
             )?;
 
         Ok(VmmData::Empty)

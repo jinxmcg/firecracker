@@ -80,6 +80,13 @@ pub struct DirtyMemoryParams {
     /// Whether to mark virtio queue pages dirty before exporting memory.
     #[serde(default)]
     pub mark_virtio_queues: bool,
+    /// Whether to perform the page copy on a background thread (live precopy
+    /// rounds): the request returns after the dirty-bitmap capture, and the
+    /// export file appears atomically (rename) when the copy completes. On
+    /// failure `<mem_file_path>.err` is written instead. Keeps the VMM event
+    /// loop — and so the guest's virtio I/O — running during a multi-GB dump.
+    #[serde(default)]
+    pub background: bool,
 }
 
 fn default_dirty_memory_sync() -> bool {

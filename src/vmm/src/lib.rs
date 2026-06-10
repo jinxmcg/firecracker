@@ -494,11 +494,17 @@ impl Vmm {
     }
 
     /// Exports dirty guest memory pages without pausing vCPUs.
+    ///
+    /// With `background == true` only the dirty-bitmap capture runs here (on the
+    /// VMM thread); the page copy runs on a spawned thread and the file appears
+    /// atomically (rename) when complete — the event loop, and therefore device
+    /// emulation, is not blocked for the duration of a multi-GB copy.
     pub fn export_dirty_memory(
         &mut self,
         mem_file_path: &std::path::Path,
         sync: bool,
         mark_virtio_queues: bool,
+        background: bool,
     ) -> Result<(), persist::CreateSnapshotError> {
         let kvm_vm = self.vm.as_kvm().ok_or_else(|| {
             persist::CreateSnapshotError::MicrovmState(persist::MicrovmStateError::NotAllowed(
@@ -511,9 +517,12 @@ impl Vmm {
                 .mark_virtio_queue_memory_dirty(kvm_vm.guest_memory());
         }
 
-        kvm_vm.export_dirty_memory_to_file(mem_file_path, sync)?;
+        kvm_vm.export_dirty_memory_to_file(mem_file_path, sync, background)?;
 
         // Keep queue pages dirty for the final paused device-state snapshot.
+        // (In background mode the capture has already happened synchronously
+        // above, so these marks land in the *next* round's bitmap, same as the
+        // inline path.)
         self.device_manager
             .mark_virtio_queue_memory_dirty(kvm_vm.guest_memory());
 

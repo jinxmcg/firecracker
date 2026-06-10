@@ -210,6 +210,76 @@ fn test_dirty_bitmap_incremental_reset() {
     vmm.lock().unwrap().stop(FcExitCode::Ok);
 }
 
+/// Background dirty export: the request returns after the bitmap capture; the file is
+/// published atomically (rename of `<path>.tmp`) when the dump thread completes, with
+/// no `.err` marker. The pipeline must be reusable for the next round.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn test_background_dirty_export() {
+    use std::path::PathBuf;
+
+    let (vmm, _evmgr) = vmm::test_utils::dirty_tracking_vmm(Some(NOISY_KERNEL_IMAGE));
+
+    // Let the noisy guest dirty some pages; export LIVE (the whole point).
+    thread::sleep(Duration::from_millis(100));
+
+    let dir = std::env::temp_dir().join(format!("fc-bg-export-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let export = |path: &std::path::Path| {
+        // Retry while the previous round's dump thread still owns the capture
+        // (the caller-visible "busy" contract), bounded.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match vmm
+                .lock()
+                .unwrap()
+                .export_dirty_memory(path, false, true, true)
+            {
+                Ok(()) => break,
+                Err(err) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "background export did not become available: {err}"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+        // Bounded poll for the atomic publish.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let err_path = PathBuf::from(format!("{}.err", path.display()));
+        while !path.exists() {
+            assert!(!err_path.exists(), "background export reported failure");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background export never published"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!err_path.exists());
+        assert!(!PathBuf::from(format!("{}.tmp", path.display())).exists());
+    };
+
+    let round1 = dir.join("round1.mem");
+    export(&round1);
+    // Sparse file of full guest-memory size with some real (dirty) data.
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(&round1).unwrap();
+    assert!(meta.len() > 0);
+    assert!(
+        meta.blocks() > 0,
+        "a churning guest's export must contain data pages"
+    );
+
+    // Next round must work identically (in-flight guard released, tmp path reusable).
+    let round2 = dir.join("round2.mem");
+    export(&round2);
+
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn test_disallow_snapshots_without_pausing() {
     let (vmm, _) = default_vmm(Some(NOISY_KERNEL_IMAGE));

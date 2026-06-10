@@ -145,6 +145,21 @@ impl<'a> GuestMemorySlot<'a> {
         kvm_bitmap: &[u64],
         page_size: usize,
     ) -> Result<(), MemoryError> {
+        self.dump_dirty_with(writer, kvm_bitmap, page_size, true)
+    }
+
+    /// Like [`Self::dump_dirty`], but `consult_fc_bitmap` selects whether the live
+    /// per-region Firecracker `AtomicBitmap` is OR-ed in per page. The background
+    /// dirty export passes `false`: its caller already merged (and reset) that bitmap
+    /// into `kvm_bitmap` on the VMM thread, and consulting the *live* bitmap from the
+    /// export thread would race device emulation marking fresh pages.
+    pub(crate) fn dump_dirty_with<T: WriteVolatile + std::io::Seek>(
+        &self,
+        writer: &mut T,
+        kvm_bitmap: &[u64],
+        page_size: usize,
+        consult_fc_bitmap: bool,
+    ) -> Result<(), MemoryError> {
         let firecracker_bitmap = self.slice.bitmap();
         let mut write_size = 0;
         let mut skip_size = 0;
@@ -161,7 +176,8 @@ impl<'a> GuestMemorySlot<'a> {
             for j in 0..64 {
                 let is_kvm_page_dirty = ((v >> j) & 1u64) != 0u64;
                 let page_offset = ((i * 64) + j) * page_size;
-                let is_firecracker_page_dirty = firecracker_bitmap.dirty_at(page_offset);
+                let is_firecracker_page_dirty =
+                    consult_fc_bitmap && firecracker_bitmap.dirty_at(page_offset);
 
                 // We process 64 pages at a time, however the number of pages
                 // in the slot might not be a multiple of 64. We need to break
@@ -649,6 +665,22 @@ where
         dirty_bitmap: &DirtyBitmap,
     ) -> Result<(), MemoryError>;
 
+    /// Dumps exactly the pages in `dirty_bitmap` — a bitmap the caller already
+    /// captured (KVM dirt merged with the Firecracker bitmap via
+    /// [`Self::merge_and_reset_dirty`]). Unlike [`Self::dump_dirty`] this neither
+    /// consults nor resets the live region bitmaps, so it is safe to run on a
+    /// thread other than the VMM thread while device emulation continues.
+    fn dump_dirty_captured<T: WriteVolatile + std::io::Seek>(
+        &self,
+        writer: &mut T,
+        dirty_bitmap: &DirtyBitmap,
+    ) -> Result<(), MemoryError>;
+
+    /// Merges the live per-region Firecracker bitmaps (device/VMM-side dirt) into
+    /// `dirty_bitmap` and resets them. MUST run on the VMM thread: device emulation
+    /// marks these bitmaps, and a reset racing those marks would lose pages.
+    fn merge_and_reset_dirty(&self, dirty_bitmap: &mut DirtyBitmap, page_size: usize);
+
     /// Resets all the memory region bitmaps
     fn reset_dirty(&self);
 
@@ -837,6 +869,62 @@ impl GuestMemoryExtension for GuestMemoryMmap {
         }
 
         write_result
+    }
+
+    /// Dumps exactly the captured `dirty_bitmap`; no live-bitmap consult, no reset.
+    fn dump_dirty_captured<T: WriteVolatile + std::io::Seek>(
+        &self,
+        writer: &mut T,
+        dirty_bitmap: &DirtyBitmap,
+    ) -> Result<(), MemoryError> {
+        let page_size = host_page_size();
+
+        self.iter()
+            .flat_map(|region| region.slots())
+            .try_for_each(|(mem_slot, plugged)| {
+                if !plugged {
+                    let ilen = i64::try_from(mem_slot.slice.len())
+                        .map_err(|_| MemoryError::SlotSizeTooLarge)?;
+                    writer
+                        .seek(SeekFrom::Current(ilen))
+                        .map_err(MemoryError::SeekError)?;
+                } else {
+                    let kvm_bitmap = dirty_bitmap
+                        .get(&mem_slot.slot)
+                        .ok_or(MemoryError::DirtyBitmapNotFound(mem_slot.slot))?;
+                    mem_slot.dump_dirty_with(writer, kvm_bitmap, page_size, false)?;
+                }
+                Ok(())
+            })
+    }
+
+    /// Merges + resets the live Firecracker bitmaps into `dirty_bitmap` (VMM thread only).
+    fn merge_and_reset_dirty(&self, dirty_bitmap: &mut DirtyBitmap, page_size: usize) {
+        self.iter()
+            .flat_map(|region| region.plugged_slots())
+            .for_each(|mem_slot| {
+                if mem_slot.slice.bitmap().is_none() {
+                    return;
+                }
+                let expected_len = (mem_slot.slice.len() / page_size).div_ceil(64);
+                let words = dirty_bitmap.entry(mem_slot.slot).or_default();
+                // The ring path pads to exactly this length; the legacy
+                // KVM_GET_DIRTY_LOG path returns it. Resize is belt-and-braces.
+                words.resize(expected_len, 0);
+                let firecracker_bitmap = mem_slot.slice.bitmap();
+                for (i, word) in words.iter_mut().enumerate() {
+                    for j in 0..64 {
+                        let page_offset = ((i * 64) + j) * page_size;
+                        if page_offset >= mem_slot.slice.len() {
+                            break;
+                        }
+                        if firecracker_bitmap.dirty_at(page_offset) {
+                            *word |= 1u64 << j;
+                        }
+                    }
+                }
+            });
+        self.reset_dirty();
     }
 
     /// Resets all the memory region bitmaps
@@ -1419,6 +1507,87 @@ mod tests {
             guest_memory.dump_dirty(&mut reader, &kvm_dirty_bitmap),
             Err(MemoryError::DirtyBitmapTooSmall)
         ));
+    }
+
+    /// The background-export capture/dump split: `merge_and_reset_dirty` must fold the
+    /// live Firecracker bitmaps into the captured bitmap and reset them, and
+    /// `dump_dirty_captured` must dump exactly the captured set — neither consulting
+    /// (pages dirtied after the capture must NOT leak into the dump) nor resetting
+    /// (post-capture dirt must survive for the next round) the live bitmaps.
+    #[test]
+    fn test_merge_and_reset_then_dump_captured() {
+        let page_size = host_page_size();
+
+        // Two regions of two pages each, with a one page gap between them (the same
+        // layout as test_dump_dirty: slot 0 = region 1, slot 1 = region 2).
+        let region_1_address = GuestAddress(0);
+        let region_2_address = GuestAddress(page_size as u64 * 3);
+        let region_size = page_size * 2;
+        let mem_regions = [
+            (region_1_address, region_size),
+            (region_2_address, region_size),
+        ];
+        let guest_memory = into_region_ext(
+            anonymous(mem_regions.into_iter(), true, HugePageConfig::None).unwrap(),
+        );
+
+        let zeros = vec![0u8; page_size];
+        let ones = vec![1u8; page_size];
+        let twos = vec![2u8; page_size];
+
+        // Pre-capture dirt, via the Firecracker bitmaps only (device-style writes):
+        // region 1 page 1 and region 2 page 0.
+        guest_memory
+            .write(&ones, GuestAddress(page_size as u64))
+            .unwrap();
+        guest_memory.write(&twos, region_2_address).unwrap();
+
+        // Capture: an (empty) KVM bitmap merged with the Firecracker dirt.
+        let mut captured: DirtyBitmap = HashMap::new();
+        guest_memory.merge_and_reset_dirty(&mut captured, page_size);
+        assert_eq!(captured.get(&0).unwrap(), &vec![0b10]);
+        assert_eq!(captured.get(&1).unwrap(), &vec![0b01]);
+        // ...and the live bitmaps were reset by the capture.
+        guest_memory.iter().for_each(|r| {
+            assert!(!r.bitmap().dirty_at(0));
+            assert!(!r.bitmap().dirty_at(page_size));
+        });
+
+        // POST-capture dirt (concurrent guest/device activity while the background
+        // dump runs): region 1 page 0. Must not appear in the captured dump.
+        guest_memory.write(&twos, region_1_address).unwrap();
+
+        let file = TempFile::new().unwrap();
+        file.as_file().set_len(page_size as u64 * 4).unwrap();
+        let mut writer = file.into_file();
+        guest_memory
+            .dump_dirty_captured(&mut writer, &captured)
+            .unwrap();
+
+        // Exactly the captured pages, holes elsewhere — the freshly-dirtied
+        // region 1 page 0 (now 2s in memory) stays a hole.
+        let expected = [
+            zeros.as_slice(), // hole: dirtied only AFTER the capture
+            ones.as_slice(),
+            twos.as_slice(),
+            zeros.as_slice(), // hole: never dirtied
+        ]
+        .concat();
+        let mut contents = Vec::new();
+        writer.seek(SeekFrom::Start(0)).unwrap();
+        writer.read_to_end(&mut contents).unwrap();
+        assert_eq!(expected, contents);
+
+        // And the captured dump did NOT reset the live bitmaps: the post-capture
+        // dirt is still pending for the next round.
+        assert!(
+            guest_memory
+                .iter()
+                .next()
+                .unwrap()
+                .bitmap()
+                .dirty_at(0)
+        );
     }
 
     #[test]

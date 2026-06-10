@@ -8,8 +8,8 @@
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Barrier, Mutex, MutexGuard};
 
 #[cfg(target_arch = "x86_64")]
@@ -41,6 +41,12 @@ use crate::vstate::memory::{
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vcpu::{StartThreadedError, VcpuError, VcpuHandle};
 use crate::{DirtyBitmap, Vcpu, mem_size_mib};
+
+/// True while a background dirty export thread owns a captured dirty bitmap.
+/// Process-wide is correct: one Firecracker process hosts exactly one microVM.
+/// Guards against a second capture resetting dirty state mid-dump (every dump
+/// path checks it: background + inline export, full/diff snapshot).
+static DIRTY_EXPORT_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 /// Error type for [`KvmVm::start_vcpus`].
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -672,6 +678,13 @@ impl KvmVm {
     ) -> Result<(), CreateSnapshotError> {
         use self::CreateSnapshotError::*;
 
+        if DIRTY_EXPORT_IN_FLIGHT.load(Ordering::Acquire) {
+            return Err(MemoryBackingFile(
+                "dirty_export_busy",
+                std::io::Error::other("a background dirty export is already in flight"),
+            ));
+        }
+
         // Determine what size our total memory area is.
         let mem_size_mib = mem_size_mib(self.guest_memory());
         let expected_size = mem_size_mib * 1024 * 1024;
@@ -734,15 +747,120 @@ impl KvmVm {
     }
 
     /// Exports currently dirty guest memory pages without requiring the vCPUs to be paused.
+    ///
+    /// `background == false`: dump inline on the calling (VMM) thread; the file is
+    /// complete when this returns. The whole dump blocks the event loop, so device
+    /// emulation (virtio net/block) starves for the duration — only acceptable when
+    /// the guest is paused anyway (suspend, cutover).
+    ///
+    /// `background == true` (live precopy rounds): only the bitmap capture happens
+    /// on the VMM thread (cheap with the dirty ring); the page copy runs on a
+    /// spawned thread against `<path>.tmp`, atomically renamed to `<path>` on
+    /// completion (`<path>.err` is written instead on failure). The caller polls
+    /// for the rename. Returns as soon as the thread is spawned, so the event loop
+    /// (and the guest's I/O) keeps running during the copy.
+    ///
+    /// Background correctness: pages the guest dirties during the copy are
+    /// re-logged by KVM and re-shipped next round (torn copies included), exactly
+    /// like pages dirtied between rounds; the final round runs paused. Device/VMM
+    /// dirt (the Firecracker `AtomicBitmap`) is merged into the captured bitmap and
+    /// reset *here, on the VMM thread* — doing either from the export thread would
+    /// race device emulation and could lose pages.
     pub(crate) fn export_dirty_memory_to_file(
         &self,
         mem_file_path: &Path,
         sync: bool,
+        background: bool,
     ) -> Result<(), CreateSnapshotError> {
         use self::CreateSnapshotError::*;
 
         let mem_size_mib = mem_size_mib(self.guest_memory());
         let expected_size = mem_size_mib * 1024 * 1024;
+
+        if background {
+            // One background export at a time: a second capture would reset dirty
+            // tracking the in-flight dump still owns the previous capture of.
+            if DIRTY_EXPORT_IN_FLIGHT
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Err(MemoryBackingFile(
+                    "dirty_export_busy",
+                    std::io::Error::other("a background dirty export is already in flight"),
+                ));
+            }
+
+            let page_size = host_page_size();
+            let capture = || -> Result<crate::DirtyBitmap, CreateSnapshotError> {
+                let mut dirty_bitmap = self.get_dirty_bitmap()?;
+                self.guest_memory()
+                    .merge_and_reset_dirty(&mut dirty_bitmap, page_size);
+                Ok(dirty_bitmap)
+            };
+            let dirty_bitmap = match capture() {
+                Ok(bitmap) => Arc::new(bitmap),
+                Err(err) => {
+                    DIRTY_EXPORT_IN_FLIGHT.store(false, Ordering::Release);
+                    return Err(err);
+                }
+            };
+            let dirty_bitmap_rollback = Arc::clone(&dirty_bitmap);
+
+            let guest_memory = self.guest_memory().clone();
+            let final_path = mem_file_path.to_path_buf();
+            let tmp_path = PathBuf::from(format!("{}.tmp", final_path.display()));
+            let err_path = PathBuf::from(format!("{}.err", final_path.display()));
+            let spawned = std::thread::Builder::new().spawn(move || {
+                let dump = || -> Result<(), CreateSnapshotError> {
+                    let mut file = OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(&tmp_path)
+                        .map_err(|err| MemoryBackingFile("open_dirty_export", err))?;
+                    file.set_len(expected_size)
+                        .map_err(|e| MemoryBackingFile("set_dirty_export_length", e))?;
+                    guest_memory.dump_dirty_captured(&mut file, &dirty_bitmap)?;
+                    file.flush()
+                        .map_err(|err| MemoryBackingFile("flush_dirty_export", err))?;
+                    if sync {
+                        file.sync_all()
+                            .map_err(|err| MemoryBackingFile("sync_dirty_export", err))?;
+                    }
+                    // Atomic publish: the poller never sees a partial file.
+                    std::fs::rename(&tmp_path, &final_path)
+                        .map_err(|err| MemoryBackingFile("rename_dirty_export", err))?;
+                    Ok(())
+                };
+                if let Err(err) = dump() {
+                    // The capture was consumed but never shipped: put it back into
+                    // the Firecracker bitmaps (atomic marks, thread-safe) so the
+                    // next export re-ships these pages instead of losing them.
+                    guest_memory.store_dirty_bitmap(&dirty_bitmap, page_size);
+                    warn!("background dirty export failed: {err}");
+                    let _ = std::fs::write(&err_path, format!("{err}"));
+                }
+                DIRTY_EXPORT_IN_FLIGHT.store(false, Ordering::Release);
+            });
+            if let Err(err) = spawned {
+                // Roll back: the capture already consumed (and reset) the dirty
+                // state but nothing was shipped — re-mark it into the Firecracker
+                // bitmaps so the next export re-ships these pages. We are still on
+                // the VMM thread, so this cannot race a concurrent reset.
+                self.guest_memory()
+                    .store_dirty_bitmap(&dirty_bitmap_rollback, page_size);
+                DIRTY_EXPORT_IN_FLIGHT.store(false, Ordering::Release);
+                return Err(MemoryBackingFile("spawn_dirty_export", err));
+            }
+            return Ok(());
+        }
+
+        if DIRTY_EXPORT_IN_FLIGHT.load(Ordering::Acquire) {
+            return Err(MemoryBackingFile(
+                "dirty_export_busy",
+                std::io::Error::other("a background dirty export is already in flight"),
+            ));
+        }
 
         // The dirty export is a partial (sparse) write: dump_dirty writes only the
         // currently-dirty pages and seeks over the rest, leaving holes. Unlike a
